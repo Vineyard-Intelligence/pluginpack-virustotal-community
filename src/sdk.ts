@@ -372,7 +372,12 @@ export function createMockContext(opts: MockContextOptions = {}): MockContext {
                       ? {
                             updateNode: async (id: string, data: Record<string, unknown>) => {
                                 const n = nodes.find((x) => x.id === id);
-                                if (n) n.data = data; // plugin passes the full merged data (host-bridge PATCH semantics)
+                                // A plugin passes a DELTA, which the host fill-merges onto whatever
+                                // is live at commit. The mock replaced instead, so a pack that
+                                // wrongly passed `{...node.data, ...patch}` looked identical here
+                                // to one that passed the patch alone — and only differed in
+                                // production, by rolling back another run's fields.
+                                if (n) n.data = { ...n.data, ...data };
                                 mock.updatedNodes.push({ id, data });
                             },
                         }
