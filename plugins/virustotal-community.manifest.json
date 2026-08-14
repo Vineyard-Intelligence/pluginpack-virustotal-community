@@ -2,7 +2,7 @@
   "identifier": "run.vineyard.pluginpacks.virustotal_community",
   "content_type": "vineyard:pluginpack",
   "name": "VirusTotal Community",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "VirusTotal v3 enrichment and pivots using the analyst's own API key, scoped to what a free community key can actually read (verified against one): IP/domain/URL reports, file-hash reports, passive-DNS resolutions and subdomain fan-out. Relationships that need a paid key are not included rather than attempted and skipped. Desktop only (VirusTotal answers no CORS headers).",
   "author": {
     "name": "VINEYARD",
@@ -27,8 +27,8 @@
       "identifier": "run.vineyard.plugins.vt_ip_report",
       "content_type": "vineyard:plugin",
       "name": "VT IP Report",
-      "version": "1.1.0",
-      "description": "For each selected IP Address, queries VirusTotal's free-tier IP report (country, ASN, owner) and folds it into the node; creates an Autonomous System node for the ASN and links it with an 'announced by' edge. Uses the analyst's own VirusTotal API key (x-apikey). Desktop only (VT sends no CORS headers).",
+      "version": "1.2.0",
+      "description": "For each selected IP Address, folds VirusTotal's IP report into the node: how many engines call it malicious or suspicious and WHICH ones, the community reputation and votes, VT's tags, plus country, ASN and owner. Creates the Autonomous System (with its RIR) via 'announced by', the announced netblock via 'within netblock', and a WHOIS Record for that netblock. Uses the analyst's own VirusTotal API key (x-apikey). Desktop only (VT sends no CORS headers).",
       "icon": "radar",
       "platforms": {
         "primary": "desktop",
@@ -55,72 +55,12 @@
             "typepack": "run.vineyard.typepacks.infrastructure",
             "category": "infrastructure",
             "name": "autonomous_system"
-          }
-        ]
-      },
-      "scopes": {
-        "graph": [
-          "node:read",
-          "node:create",
-          "node:update",
-          "edge:create"
-        ],
-        "network": [
-          {
-            "endpoint": "https://www.virustotal.com/api/v3",
-            "methods": [
-              "GET"
-            ],
-            "purpose": "VirusTotal v3 reports and relationships (free tier) — the analyst's own key via the x-apikey header."
-          }
-        ],
-        "config": [
-          {
-            "key": "api_key",
-            "label": "VirusTotal API Key",
-            "type": "string",
-            "secret": true,
-            "optional": false
-          }
-        ]
-      },
-      "lifecycle": {
-        "persistence": "opt-in",
-        "controls": [
-          "progress",
-          "cancel"
-        ],
-        "progress": "determinate"
-      }
-    },
-    {
-      "identifier": "run.vineyard.plugins.vt_domain_report",
-      "content_type": "vineyard:plugin",
-      "name": "VT Domain Report",
-      "version": "1.1.0",
-      "description": "For each selected Domain, queries VirusTotal's free-tier domain report (registrar, registration and expiry dates, raw WHOIS) and folds registrar/created/expiry into the node; creates a WHOIS Record node carrying the same dates plus the raw WHOIS text and links it with a 'has whois' edge. Uses the analyst's own VirusTotal API key. Desktop only.",
-      "icon": "globe",
-      "platforms": {
-        "primary": "desktop",
-        "web": {
-          "runtime": "sandbox-js",
-          "entry": "dist/pack.mjs"
-        },
-        "desktop": {
-          "runtime": "sandbox-js",
-          "entry": "dist/pack.mjs",
-          "min_app_version": "0.1.0"
-        }
-      },
-      "io": {
-        "consumes": [
+          },
           {
             "typepack": "run.vineyard.typepacks.infrastructure",
             "category": "infrastructure",
-            "name": "domain"
-          }
-        ],
-        "produces": [
+            "name": "netblock"
+          },
           {
             "typepack": "run.vineyard.typepacks.infrastructure",
             "category": "infrastructure",
@@ -164,11 +104,91 @@
       }
     },
     {
+      "identifier": "run.vineyard.plugins.vt_domain_report",
+      "content_type": "vineyard:plugin",
+      "name": "VT Domain Report",
+      "version": "1.2.0",
+      "description": "For each selected Domain, folds VirusTotal's domain report into the node: how many engines call it malicious or suspicious and WHICH ones, community reputation and votes, the vendor content categories, plus registrar and registration/expiry dates. Creates a WHOIS Record ('has whois'), a DNS Record node per record VT last saw ('has record'), and the last HTTPS certificate ('has certificate'). Uses the analyst's own VirusTotal API key. Desktop only.",
+      "icon": "globe",
+      "platforms": {
+        "primary": "desktop",
+        "web": {
+          "runtime": "sandbox-js",
+          "entry": "dist/pack.mjs"
+        },
+        "desktop": {
+          "runtime": "sandbox-js",
+          "entry": "dist/pack.mjs",
+          "min_app_version": "0.1.0"
+        }
+      },
+      "io": {
+        "consumes": [
+          {
+            "typepack": "run.vineyard.typepacks.infrastructure",
+            "category": "infrastructure",
+            "name": "domain"
+          }
+        ],
+        "produces": [
+          {
+            "typepack": "run.vineyard.typepacks.infrastructure",
+            "category": "infrastructure",
+            "name": "whois_record"
+          },
+          {
+            "typepack": "run.vineyard.typepacks.infrastructure",
+            "category": "infrastructure",
+            "name": "dns_record"
+          },
+          {
+            "typepack": "run.vineyard.typepacks.infrastructure",
+            "category": "infrastructure",
+            "name": "certificate"
+          }
+        ]
+      },
+      "scopes": {
+        "graph": [
+          "node:read",
+          "node:create",
+          "node:update",
+          "edge:create"
+        ],
+        "network": [
+          {
+            "endpoint": "https://www.virustotal.com/api/v3",
+            "methods": [
+              "GET"
+            ],
+            "purpose": "VirusTotal v3 reports and relationships (free tier) — the analyst's own key via the x-apikey header."
+          }
+        ],
+        "config": [
+          {
+            "key": "api_key",
+            "label": "VirusTotal API Key",
+            "type": "string",
+            "secret": true,
+            "optional": false
+          }
+        ]
+      },
+      "lifecycle": {
+        "persistence": "opt-in",
+        "controls": [
+          "progress",
+          "cancel"
+        ],
+        "progress": "determinate"
+      }
+    },
+    {
       "identifier": "run.vineyard.plugins.vt_url_report",
       "content_type": "vineyard:plugin",
       "name": "VT URL Report",
-      "version": "1.1.0",
-      "description": "For each selected URL, queries VirusTotal's free-tier URL report (HTTP status, page title, final URL) and folds it into the node; also resolves the last serving IP (a free-tier relationship) and links it with a 'resolves to' edge. Uses the analyst's own VirusTotal API key. Desktop only.",
+      "version": "1.2.0",
+      "description": "For each selected URL, folds VirusTotal's URL report into the node: how many engines call it malicious or suspicious and WHICH ones, community reputation and votes, vendor categories and threat names, plus HTTP status, page title and final URL. Links the last serving IP ('resolves to'), the redirect chain ('redirects to'), the hosts the page reached out to ('has domain') and the served content's SHA-256 ('has hash'). Uses the analyst's own VirusTotal API key. Desktop only.",
       "icon": "link",
       "platforms": {
         "primary": "desktop",
@@ -195,6 +215,21 @@
             "typepack": "run.vineyard.typepacks.infrastructure",
             "category": "infrastructure",
             "name": "ip_address"
+          },
+          {
+            "typepack": "run.vineyard.typepacks.infrastructure",
+            "category": "web",
+            "name": "url"
+          },
+          {
+            "typepack": "run.vineyard.typepacks.infrastructure",
+            "category": "infrastructure",
+            "name": "domain"
+          },
+          {
+            "typepack": "run.vineyard.typepacks.threat",
+            "category": "threat",
+            "name": "file_hash"
           }
         ]
       },
@@ -237,8 +272,8 @@
       "identifier": "run.vineyard.plugins.vt_file_report",
       "content_type": "vineyard:plugin",
       "name": "VT File Report",
-      "version": "1.1.0",
-      "description": "Looks up SHA-256 / SHA-1 / MD5 hashes on VirusTotal's file report — detection counts, vendor type description, tags and submission stats. A selected File Hash node is enriched in place (even when it only carried an MD5); anything else that named the hash, such as a Malware node, gets a 'has hash' edge to the File Hash node. Hashes can also be pasted into the Run dialog. Uses the analyst's own VirusTotal API key. Desktop only.",
+      "version": "1.2.0",
+      "description": "Looks up SHA-256 / SHA-1 / MD5 hashes on VirusTotal's file report: detection counts and WHICH engines detected it, the malware names they gave, file type, tags, fuzzy hashes (ssdeep/TLSH) and submission stats. A selected File Hash node is enriched in place (even when it only carried an MD5); anything else that named the hash, such as a Malware node, gets a 'has hash' edge. The suggested threat label becomes a Malware node via 'classified as'. Hashes can also be pasted into the Run dialog. Uses the analyst's own VirusTotal API key. Desktop only.",
       "icon": "file-digit",
       "platforms": {
         "primary": "desktop",
@@ -280,6 +315,11 @@
             "typepack": "run.vineyard.typepacks.threat",
             "category": "threat",
             "name": "file_hash"
+          },
+          {
+            "typepack": "run.vineyard.typepacks.threat",
+            "category": "threat",
+            "name": "malware"
           }
         ]
       },
@@ -322,8 +362,8 @@
       "identifier": "run.vineyard.plugins.vt_pivot_resolutions",
       "content_type": "vineyard:plugin",
       "name": "VT Pivot Resolutions",
-      "version": "1.1.0",
-      "description": "For each selected IP Address or Domain, fans out VirusTotal's free-tier resolutions (hostnames an IP served, IPs a domain resolved to) and creates the missing nodes, linking both directions with 'resolves to' edges. Uses the analyst's own VirusTotal API key. Desktop only.",
+      "version": "1.2.0",
+      "description": "For each selected IP Address or Domain, fans out VirusTotal's resolutions (hostnames an IP served, IPs a domain resolved to), creates the missing nodes with the detection counts VirusTotal returns for each, and links both directions with 'resolves to' edges. Uses the analyst's own VirusTotal API key. Desktop only.",
       "icon": "git-fork",
       "platforms": {
         "primary": "desktop",
@@ -402,8 +442,8 @@
       "identifier": "run.vineyard.plugins.vt_pivot_relations",
       "content_type": "vineyard:plugin",
       "name": "VT Subdomains",
-      "version": "1.1.0",
-      "description": "For each selected Domain, fans out the subdomains VirusTotal knows about and links each one back with a 'subdomain of' edge. Answers on a free community key. Uses the analyst's own VirusTotal API key. Desktop only.",
+      "version": "1.2.0",
+      "description": "For each selected Domain, fans out the subdomains VirusTotal knows about, links each one back with a 'subdomain of' edge, and folds in the full report VirusTotal returns per subdomain — detection counts and the engines that flagged it, registrar, registration and expiry dates, vendor categories — so a flagged subdomain is visible without a second lookup. Answers on a free community key. Uses the analyst's own VirusTotal API key. Desktop only.",
       "icon": "git-branch",
       "platforms": {
         "primary": "desktop",

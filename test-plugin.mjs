@@ -33,6 +33,11 @@ function makeGraph(nodeById) {
     async get(id) {
       return nodeById[id] || null;
     },
+    // The derived-object rule (AS / netblock / WHOIS) asks the case what it already holds.
+    async list(o) {
+      const all = [...Object.values(nodeById), ...createdNodes];
+      return { nodes: o?.type ? all.filter((n) => n.type === o.type) : all };
+    },
     async createNode(draft) {
       const node = { id: `n${createdNodes.length + 1}`, type: draft.type, data: draft.data };
       createdNodes.push(node);
@@ -149,18 +154,21 @@ const vtErr = (code, message) => ({ error: { code, message } });
   // never touched, and the host fill-merges a plugin's data onto LIVE at commit — so a value some
   // other run wrote in between is rolled back. The update must carry the filled fields ALONE.
   check(
-    "ip: writes a DELTA — the three filled fields and nothing else",
+    "ip: writes a DELTA — only fields this run filled",
     graph.updates.length === 1 &&
-      JSON.stringify(graph.updates[0].data) === JSON.stringify({ country_code: "US", asn: "AS15169", organization: "GOOGLE" }),
+      graph.updates[0].data.country_code === "US" &&
+      graph.updates[0].data.asn === "AS15169" &&
+      graph.updates[0].data.organization === "GOOGLE",
   );
-  check("ip: no field the run did not fill is echoed back", !("reverse_dns" in graph.updates[0].data));
-  const as = graph.createdNodes.find((n) => n.type === "infrastructure.autonomous_system");
-  check("ip: an AS node is created from the ASN", as && as.data.autonomous_system_number === 15169 && as.data.autonomous_system_name === "GOOGLE");
-  // autonomous_system.country_code means country of REGISTRATION; VT's `country` is where this one
-  // IP geolocates. The AS node's identity is the ASN alone, so writing it would let a single host
-  // rewrite the shared AS node for every pack that reads it.
-  check("ip: the IP's geolocated country is NOT stamped on the shared AS node", as && !("country_code" in as.data));
-  check("ip: edge label matches the IP Intelligence pack", graph.createdEdges[0].label === "announced by");
+  // The delta contract: a field the node already had, that this run did not learn, must not ride
+  // along — the host fill-merges the delta onto LIVE at commit, so a stale value rolls back
+  // whatever another run wrote in between.
+  check("ip: no field the run did not fill is echoed back", !("reverse_dns" in graph.updates[0].data) && !("ip_address" in graph.updates[0].data));
+  // DERIVED objects are context, not the answer. A case that does not already hold this AS does not
+  // get one minted for it — the ASN and owner are on the IP node either way.
+  check("ip: no AS node is invented when the case has none", !graph.createdNodes.some((n) => n.type === "infrastructure.autonomous_system"));
+  check("ip: ...and no edge to one either", graph.createdEdges.length === 0);
+  check("ip: the ASN and owner are still on the IP node", graph.updates[0].data.asn === "AS15169" && graph.updates[0].data.organization === "GOOGLE");
 }
 {
   // Measured: VT answers 400 InvalidArgumentError for a malformed address. Treating it as fatal
@@ -194,6 +202,40 @@ const vtErr = (code, message) => ({ error: { code, message } });
   check("ip: a selected non-IP node triggers no request", net.calls.length === 0);
 }
 
+{
+  // …and when the case DOES hold them, they are enriched and linked instead of duplicated.
+  const body = { data: { attributes: {
+    country: "kr", asn: 45996, as_owner: "DAOU TECHNOLOGY", regional_internet_registry: "APNIC",
+    network: "27.102.0.0/16", whois: "inetnum: 27.102.0.0 - 27.102.255.255",
+  } } };
+  const nodes = {
+    ip1: { id: "ip1", type: "infrastructure.ip_address", data: { ip_address: "27.102.137.126" } },
+    as1: { id: "as1", type: "infrastructure.autonomous_system", data: { autonomous_system_number: 45996 } },
+    nb1: { id: "nb1", type: "infrastructure.netblock", data: { cidr: "27.102.0.0/16" } },
+    w1: { id: "w1", type: "infrastructure.whois_record", data: { subject: "27.102.0.0/16" } },
+  };
+  const net = makeNet(() => ({ status: 200, body }));
+  const graph = makeGraph(nodes);
+  const r = await ipPlugin.run({ ...RUN, config: KEY, input: { selection: ["ip1"] }, net, graph });
+  check("derived: an existing AS node is linked, not duplicated", r.counts.asns === 1 && !graph.createdNodes.length);
+  const asUpd = graph.updates.find((u) => u.id === "as1");
+  check("derived: the existing AS gains the RIR it was missing", asUpd && asUpd.data.registry === "APNIC" && asUpd.data.autonomous_system_name === "DAOU TECHNOLOGY");
+  check("derived: ...as a delta — the identity field is not rewritten", asUpd && !("autonomous_system_number" in asUpd.data));
+  check("derived: the IP's geolocated country is still NOT stamped on the shared AS", asUpd && !("country_code" in asUpd.data));
+  check("derived: an existing netblock is linked", graph.createdEdges.some((e) => e.from === "ip1" && e.to === "nb1" && e.label === "within netblock"));
+  const wUpd = graph.updates.find((u) => u.id === "w1");
+  check("derived: the existing WHOIS record for that block gains the raw text", wUpd && /inetnum/.test(wUpd.data.raw));
+  check("derived: ...and hangs off the netblock, not the address", graph.createdEdges.some((e) => e.from === "nb1" && e.to === "w1" && e.label === "has whois"));
+}
+{
+  // A netblock the case does not hold means its WHOIS has nothing to hang from either.
+  const body = { data: { attributes: { asn: 1, network: "10.0.0.0/8", whois: "x" } } };
+  const net = makeNet(() => ({ status: 200, body }));
+  const graph = makeGraph({ ip1: { id: "ip1", type: "infrastructure.ip_address", data: { ip_address: "10.0.0.1" } } });
+  const r = await ipPlugin.run({ ...RUN, config: KEY, input: { selection: ["ip1"] }, net, graph });
+  check("derived: no netblock, so no WHOIS record either", graph.createdNodes.length === 0 && r.counts.netblocks === 0);
+}
+
 // ================================================================ vt_domain_report
 {
   // creation_date/expiration_date are plain unix fields on the report. The raw WHOIS below carries
@@ -217,10 +259,21 @@ const vtErr = (code, message) => ({ error: { code, message } });
   check("domain: registrar and creation date folded into the node", upd.registrar === "MarkMonitor Inc." && upd.created_date === "1997-09-15");
   check("domain: expiry comes from the expiration_date FIELD, not a WHOIS-text regex", upd.expiration_date === "2028-09-14");
   check("domain: the update is a delta", Object.keys(upd).join() === "registrar,created_date,expiration_date");
-  const w = graph.createdNodes.find((n) => n.type === "infrastructure.whois_record");
-  check("domain: a WHOIS record node carries subject + both dates", w && w.data.subject === "google.com" && w.data.created_at === "1997-09-15" && w.data.expires_at === "2028-09-14");
-  check("domain: raw WHOIS text is kept", w && w.data.raw.includes("Registry Expiry Date"));
-  check("domain: edge label", graph.createdEdges[0].label === "has whois");
+  check("domain: no WHOIS node is invented when the case has none", !graph.createdNodes.some((n) => n.type === "infrastructure.whois_record"));
+}
+
+{
+  // An existing WHOIS record for the domain is filled in instead.
+  const body = { data: { attributes: { registrar: "MarkMonitor Inc.", creation_date: 874306800, expiration_date: 1852516800, whois: "Registry Expiry Date: 2028-09-14T04:00:00Z" } } };
+  const net = makeNet(() => ({ status: 200, body }));
+  const graph = makeGraph({
+    d1: { id: "d1", type: "infrastructure.domain", data: { domain_name: "google.com" } },
+    w1: { id: "w1", type: "infrastructure.whois_record", data: { subject: "google.com" } },
+  });
+  const r = await domainPlugin.run({ ...RUN, config: KEY, input: { selection: ["d1"] }, net, graph });
+  const w = graph.updates.find((u) => u.id === "w1");
+  check("domain: an existing WHOIS record gains the dates and the raw text", r.counts.whois === 1 && w.data.created_at === "1997-09-15" && w.data.expires_at === "2028-09-14" && /Registry Expiry/.test(w.data.raw));
+  check("domain: ...and is linked", graph.createdEdges.some((e) => e.from === "d1" && e.to === "w1" && e.label === "has whois"));
 }
 
 // ================================================================ vt_url_report
@@ -381,6 +434,46 @@ const vtErr = (code, message) => ({ error: { code, message } });
   check("file: says what to do when given no hashes", /No hashes/.test(r.summary));
 }
 
+{
+  // The same file already in the case under a node nobody selected, holding only its MD5. The
+  // host's own de-dup compares the sha256 alone (the type's identity), so that node is invisible
+  // to it — the report would land on a second, duplicate file_hash node.
+  const attrs = {
+    sha256: "a".repeat(64), sha1: "b".repeat(40), md5: "c".repeat(32),
+    last_analysis_stats: { malicious: 9 },
+  };
+  for (const [key, seeded, label] of [
+    ["sha256", { sha256: attrs.sha256 }, "sha256"],
+    ["sha1", { sha1: attrs.sha1 }, "sha1"],
+    ["md5", { md5: attrs.md5 }, "md5"],
+  ]) {
+    const net = makeNet(() => ({ status: 200, body: { data: { attributes: attrs } } }));
+    const graph = makeGraph({ old: { id: "old", type: "threat.file_hash", data: seeded } });
+    const r = await filePlugin.run({ ...RUN, config: KEY, params: { hashes: attrs.sha256 }, input: { selection: [] }, net, graph });
+    check(`file: an existing node found by ${label} is enriched, not duplicated`, r.counts.enriched === 1 && graph.updates.length === 1 && graph.updates[0].id === "old");
+    check(`file: ...and no second file_hash node appears (${label})`, !graph.createdNodes.some((n) => n.type === "threat.file_hash"));
+    check(`file: ...it gains the hashes it was missing (${label})`, graph.updates[0].data.sha256 === attrs.sha256 && graph.updates[0].data.malicious_count === 9);
+  }
+}
+{
+  // Strongest first: a sha256 match wins over a node that only shares the md5.
+  const attrs = { sha256: "d".repeat(64), sha1: "e".repeat(40), md5: "f".repeat(32) };
+  const net = makeNet(() => ({ status: 200, body: { data: { attributes: attrs } } }));
+  const graph = makeGraph({
+    weak: { id: "weak", type: "threat.file_hash", data: { md5: attrs.md5 } },
+    strong: { id: "strong", type: "threat.file_hash", data: { sha256: attrs.sha256 } },
+  });
+  await filePlugin.run({ ...RUN, config: KEY, params: { hashes: attrs.sha256 }, input: { selection: [] }, net, graph });
+  check("file: the sha256 match wins over an md5-only match", graph.updates.length === 1 && graph.updates[0].id === "strong");
+}
+{
+  // A file genuinely new to the case still gets a node.
+  const net = makeNet(() => ({ status: 200, body: { data: { attributes: { sha256: "9".repeat(64) } } } }));
+  const graph = makeGraph({});
+  const r = await filePlugin.run({ ...RUN, config: KEY, params: { hashes: "9".repeat(64) }, input: { selection: [] }, net, graph });
+  check("file: a file the case has never seen is still created", r.counts.created === 1 && graph.createdNodes.some((n) => n.type === "threat.file_hash"));
+}
+
 // ================================================================ vt_pivot_resolutions
 {
   // Measured shape: the resolution object's id is <ip><hostname> (unusable), the readable values
@@ -414,6 +507,204 @@ const vtErr = (code, message) => ({ error: { code, message } });
   await resolutionsPlugin.run({ ...RUN, config: KEY, input: { selection: ["d1"] }, net, graph });
   check("resolutions: an IPv6 address is accepted", graph.createdNodes.some((n) => n.data.ip_address === "2607:f8b0:400e:c17::64"));
   check("resolutions: a bare hex string is not mistaken for an IPv6 address", graph.createdNodes.length === 1);
+}
+
+// ================================================================ the verdict data itself
+// The report this pack exists to fetch. It used to read three fields off an IP report and drop the
+// rest — including all 91 engine verdicts, the counts, the reputation and the votes.
+{
+  // Shapes and numbers below are the real 27.102.137.126 report.
+  const results = {
+    "ArcSight Threat Intelligence": { category: "malicious", result: "malware" },
+    ESTsecurity: { category: "malicious", result: "malicious" },
+    Fortinet: { category: "malicious", result: "malware" },
+    SOCRadar: { category: "malicious", result: "malicious" },
+    "Viettel Threat Intelligence": { category: "malicious", result: "phishing" },
+    "alphaMountain.ai": { category: "suspicious", result: "suspicious" },
+    AlphaSOC: { category: "suspicious", result: "suspicious" },
+    Acronis: { category: "harmless", result: "clean" },
+    Kaspersky: { category: "undetected", result: "unrated" },
+  };
+  const body = {
+    data: {
+      attributes: {
+        last_analysis_stats: { malicious: 5, suspicious: 2, undetected: 32, harmless: 52, timeout: 0 },
+        last_analysis_results: results,
+        reputation: 0,
+        total_votes: { harmless: 3, malicious: 7 },
+        tags: ["suspicious-udp"],
+        last_analysis_date: 1786480143,
+        country: "KR",
+        asn: 45996,
+        as_owner: "DAOU TECHNOLOGY",
+        regional_internet_registry: "APNIC",
+        network: "27.102.0.0/16",
+        whois: "inetnum: 27.102.0.0 - 27.102.255.255\nnetname: DAOU\n",
+        jarm: "29d3fd00029d29d00042d43d00041d8f924f5255cbc229bc55efa16391dad6",
+      },
+    },
+  };
+  const net = makeNet(() => ({ status: 200, body }));
+  const graph = makeGraph({
+    ip1: { id: "ip1", type: "infrastructure.ip_address", data: { ip_address: "27.102.137.126" } },
+    // Present in the case already, so the derived half of the report has somewhere to land.
+    as1: { id: "as1", type: "infrastructure.autonomous_system", data: { autonomous_system_number: 45996 } },
+    nb1: { id: "nb1", type: "infrastructure.netblock", data: { cidr: "27.102.0.0/16" } },
+    w1: { id: "w1", type: "infrastructure.whois_record", data: { subject: "27.102.0.0/16" } },
+  });
+  const r = await ipPlugin.run({ ...RUN, config: KEY, input: { selection: ["ip1"] }, net, graph });
+  const d = graph.updates.find((u) => u.id === "ip1").data;
+
+  check("verdict: the counts reach the node", d.vt_malicious === 5 && d.vt_suspicious === 2 && d.vt_harmless === 52 && d.vt_undetected === 32);
+  // "5 malicious" is a number to go look up; the engine names are the lead.
+  check("verdict: the engines that FLAGGED it are named", /Fortinet: malware/.test(d.vt_detections) && /SOCRadar: malicious/.test(d.vt_detections));
+  check("verdict: malicious engines are listed before suspicious ones", d.vt_detections.indexOf("Fortinet") < d.vt_detections.indexOf("AlphaSOC"));
+  // The ~85 engines that said clean/unrated are the noise this selection exists to leave out.
+  check("verdict: engines that said clean or unrated are left out", !/Acronis/.test(d.vt_detections) && !/Kaspersky/.test(d.vt_detections));
+  check("verdict: reputation and community votes are kept", d.vt_reputation === 0 && d.vt_votes === "3 harmless / 7 malicious");
+  check("verdict: VT's own tags are kept", d.vt_tags === "suspicious-udp");
+  check("verdict: the analysis date is kept, as a datetime", d.vt_analyzed === "2026-08-11T20:29:03.000Z");
+  check("verdict: a flagged IP is called out in the summary, not buried in counts", /1 FLAGGED/.test(r.summary) && r.counts.flagged === 1);
+  check("verdict: the update is still a delta (ip_address not echoed back)", !("ip_address" in d));
+
+  const as = graph.updates.find((u) => u.id === "as1");
+  check("ip: the RIR is written to the AS node (a declared enum, and a property OF the AS)", as.data.registry === "APNIC");
+  check("ip: the announced netblock is linked", graph.createdEdges.some((e) => e.from === "ip1" && e.to === "nb1" && e.label === "within netblock"));
+  // Keyed by the block, not the IP: the whois on an IP report describes the block, so keying it by
+  // address would make a near-identical record for every one of the 65k addresses in a /16.
+  const w = graph.updates.find((u) => u.id === "w1");
+  check("ip: the WHOIS record keyed by the NETBLOCK is the one filled in", w && /inetnum/.test(w.data.raw));
+  check("ip: ...and hangs off the netblock node", graph.createdEdges.some((e) => e.from === "nb1" && e.to === "w1" && e.label === "has whois"));
+  // JARM describes a TLS listener on one port, not the address — a different thing from the node
+  // it was being written to, so it is not written at all.
+  check("ip: jarm is NOT written to the address node", !("vt_jarm" in d) && !JSON.stringify(graph.updates).includes("jarm"));
+}
+{
+  // A clean IP must not grow an empty detections field, and must not be announced as flagged.
+  const net = makeNet(() => ({ status: 200, body: { data: { attributes: { last_analysis_stats: { malicious: 0, suspicious: 0, harmless: 54, undetected: 37 }, last_analysis_results: { A: { category: "harmless", result: "clean" } }, tags: [] } } } }));
+  const graph = makeGraph({ ip1: { id: "ip1", type: "infrastructure.ip_address", data: { ip_address: "8.8.8.8" } } });
+  const r = await ipPlugin.run({ ...RUN, config: KEY, input: { selection: ["ip1"] }, net, graph });
+  const d = graph.updates[0].data;
+  check("verdict: a clean IP gets counts but no detections field", d.vt_harmless === 54 && !("vt_detections" in d));
+  check("verdict: an empty tag list writes no field", !("vt_tags" in d));
+  check("verdict: a clean IP is not reported as flagged", r.counts.flagged === 0 && !/FLAGGED/.test(r.summary));
+}
+{
+  // Vendor categories: the distinct verdicts, vendor names dropped, deduped only by case.
+  const net = makeNet(() => ({ status: 200, body: { data: { attributes: { categories: { A: "searchengines", B: "Searchengines", C: "search engines and portals", D: "phishing" } } } } }));
+  const graph = makeGraph({ d1: { id: "d1", type: "infrastructure.domain", data: { domain_name: "a.test" } } });
+  await domainPlugin.run({ ...RUN, config: KEY, input: { selection: ["d1"] }, net, graph });
+  const cat = graph.updates[0].data.vt_categories;
+  check("categories: the same string in two cases is listed once", cat.split(", ").filter((x) => /^searchengines$/i.test(x)).length === 1);
+  // Near-matches are NOT merged on purpose — a similarity rule is the thing that eventually folds
+  // "phishing" into something harmless on the one domain where it decides the case.
+  check("categories: a near-match is kept as its own verdict, not merged away", /search engines and portals/.test(cat));
+  check("categories: the verdict that matters survives", /phishing/.test(cat));
+}
+{
+  // DNS records and the serving certificate, both free and both mapping onto declared types.
+  const body = {
+    data: {
+      attributes: {
+        last_dns_records: [
+          { type: "A", ttl: 276, value: "173.194.195.101" },
+          { type: "MX", ttl: 300, value: "smtp.google.com", priority: 10 },
+          { type: "SOA", value: "ns1.google.com" },
+        ],
+        last_https_certificate: {
+          thumbprint_sha256: "f17b9c4b5f765953518b609536736ff0da9d4363a0644ccd48fd44dc79fcf2da",
+          serial_number: "dd5ed3b07e3e084412b41c8e619d95a4",
+          subject: { CN: "*.google.com" },
+          issuer: { C: "US", O: "Google Trust Services", CN: "WR2" },
+          validity: { not_after: "2026-10-12 18:05:55", not_before: "2026-07-20 18:05:56" },
+        },
+      },
+    },
+  };
+  const net = makeNet(() => ({ status: 200, body }));
+  const graph = makeGraph({ d1: { id: "d1", type: "infrastructure.domain", data: { domain_name: "google.com" } } });
+  const r = await domainPlugin.run({ ...RUN, config: KEY, input: { selection: ["d1"] }, net, graph });
+  const recs = graph.createdNodes.filter((n) => n.type === "infrastructure.dns_record");
+  check("dns: one node per record VT last resolved", recs.length === 3 && r.counts.dns === 3);
+  check("dns: record_name is the domain, and ttl carries through", recs[0].data.record_name === "google.com" && recs[0].data.ttl === 276);
+  check("dns: no ttl field when VT gave none", !("ttl" in recs[2].data));
+  check("dns: linked with 'has record'", graph.createdEdges.filter((e) => e.label === "has record").length === 3);
+  const cert = graph.createdNodes.find((n) => n.type === "infrastructure.certificate");
+  check("cert: identity is the SHA-256 thumbprint, so a shared cert is one node", cert.data.fingerprint_sha256 === body.data.attributes.last_https_certificate.thumbprint_sha256);
+  check("cert: subject CN and issuer carried", cert.data.subject_common_name === "*.google.com" && cert.data.issuer === "Google Trust Services — WR2");
+  // VT stamps validity as `YYYY-MM-DD HH:MM:SS`; the typepack declares datetime.
+  check("cert: validity converted to ISO datetimes", cert.data.not_before === "2026-07-20T18:05:56Z" && cert.data.not_after === "2026-10-12T18:05:55Z");
+  check("cert: linked with 'has certificate'", graph.createdEdges.some((e) => e.label === "has certificate"));
+}
+{
+  // The redirect chain and contacted hosts are PLAIN ATTRIBUTES of the free URL report — the same
+  // two facts the premium redirects_to / contacted_domains relationships carry, at no extra request.
+  const body = {
+    data: {
+      attributes: {
+        last_http_response_code: 200,
+        redirection_chain: ["http://a.test/", "https://a.test/", "https://www.a.test/"],
+        outgoing_links: ["https://cdn.evil.test/x.js", "https://a.test/self", "https://cdn.evil.test/y.js", "not a url"],
+        last_http_response_content_sha256: "e".repeat(64),
+        threat_names: ["Phish.Kit"],
+      },
+    },
+  };
+  const net = makeNet((url) => (url.pathname.endsWith("/last_serving_ip_address") ? { status: 404, body: vtErr("NotFoundError", "no ip") } : { status: 200, body }));
+  const graph = makeGraph({ u1: { id: "u1", type: "web.url", data: { url: "http://a.test/" } } });
+  const r = await urlPlugin.run({ ...RUN, config: KEY, input: { selection: ["u1"] }, net, graph });
+  check("url: one request for the report (plus the serving-IP one) — the chain costs nothing extra", net.calls.length === 2);
+  const urls = graph.createdNodes.filter((n) => n.type === "web.url").map((n) => n.data.url);
+  check("url: the redirect chain becomes url nodes", urls.length === 2 && r.counts.redirects === 2);
+  check("url: the URL itself is not linked to itself", !urls.includes("http://a.test/"));
+  const doms = graph.createdNodes.filter((n) => n.type === "infrastructure.domain").map((n) => n.data.domain_name);
+  check("url: outgoing links become contacted-host nodes, deduped", doms.length === 1 && doms[0] === "cdn.evil.test");
+  check("url: a link back to the page's own host is not a pivot", !doms.includes("a.test"));
+  check("url: the served content's sha256 becomes a file hash", graph.createdNodes.some((n) => n.type === "threat.file_hash" && n.data.sha256 === "e".repeat(64)));
+  check("url: the declared `domain` field is finally filled", graph.updates[0].data.domain === "a.test");
+  check("url: threat names kept", graph.updates[0].data.vt_threat_names === "Phish.Kit");
+}
+{
+  // The engines' malware NAMES, and the family label as its own node.
+  const attrs = {
+    sha256: "f".repeat(64),
+    last_analysis_stats: { malicious: 64, undetected: 3 },
+    last_analysis_results: {
+      Kaspersky: { category: "malicious", result: "EICAR-Test-File" },
+      Acronis: { category: "harmless", result: "clean" },
+    },
+    reputation: 3789,
+    meaningful_name: "eicar.com",
+    magic: "EICAR virus test files",
+    ssdeep: "3:a+JraNvsgzsVqSwHq9:tJuOgzsko",
+    tlsh: "T141A022003B0EEE2BA20B00200032E8B00808020E2CE00A3820A020B8C83308803EC228",
+    popular_threat_classification: { suggested_threat_label: "virus.eicar/test" },
+  };
+  const net = makeNet(() => ({ status: 200, body: { data: { attributes: attrs } } }));
+  const graph = makeGraph({});
+  const r = await filePlugin.run({ ...RUN, config: KEY, params: { hashes: attrs.sha256 }, input: { selection: [] }, net, graph });
+  const f = graph.createdNodes.find((n) => n.type === "threat.file_hash");
+  check("file: the engines' malware NAMES are kept, not just the count", f.data.vt_detections === "Kaspersky: EICAR-Test-File");
+  check("file: reputation, filename and file magic kept", f.data.vt_reputation === 3789 && f.data.vt_name === "eicar.com" && /EICAR virus/.test(f.data.vt_magic));
+  // Fuzzy hashes match a file that was CHANGED — the reason to keep them beside the sample.
+  check("file: ssdeep and TLSH kept as pivots", f.data.vt_ssdeep === attrs.ssdeep && f.data.vt_tlsh === attrs.tlsh);
+  const fam = graph.createdNodes.find((n) => n.type === "threat.malware");
+  check("file: the suggested threat label becomes a Malware family node", fam && fam.data.name === "virus.eicar/test" && fam.data.is_family === true);
+  check("file: ...linked from the file hash with 'classified as'", graph.createdEdges.some((e) => e.from === f.id && e.to === fam.id && e.label === "classified as"));
+  check("file: families counted", r.counts.families === 1);
+}
+{
+  // A cap that is not reported reads as "that is all there was".
+  const many = Array.from({ length: 40 }, (_, i) => ({ type: "A", value: `10.0.0.${i}` }));
+  const net = makeNet(() => ({ status: 200, body: { data: { attributes: { last_dns_records: many } } } }));
+  const graph = makeGraph({ d1: { id: "d1", type: "infrastructure.domain", data: { domain_name: "a.test" } } });
+  const r = await domainPlugin.run({ ...RUN, config: KEY, input: { selection: ["d1"] }, net, graph });
+  check("caps: DNS records are capped", r.counts.dns === 25);
+  const lots = Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`E${i}`, { category: "malicious", result: "bad" }]));
+  const net2 = makeNet(() => ({ status: 200, body: { data: { attributes: { last_analysis_results: lots, last_analysis_stats: { malicious: 40 } } } } }));
+  const graph2 = makeGraph({ ip1: { id: "ip1", type: "infrastructure.ip_address", data: { ip_address: "1.2.3.4" } } });
+  await ipPlugin.run({ ...RUN, config: KEY, input: { selection: ["ip1"] }, net: net2, graph: graph2 });
+  check("caps: a long detections list says how many it left out", /\(\+15 more\)$/.test(graph2.updates[0].data.vt_detections));
 }
 
 // ================================================================ vt_pivot_relations (subdomains)
@@ -501,6 +792,122 @@ const vtErr = (code, message) => ({ error: { code, message } });
     threw = e;
   }
   check("cancel: aborts during a 429 backoff instead of sleeping it out", threw && /cancelled/.test(threw.message) && Date.now() - started < 5000);
+}
+
+// ================================================================ relationship pages carry REPORTS
+{
+  // /domains/{d}/subdomains returns a FULL domain report per entry. Reading only the name off it
+  // discarded 120 reports already paid for — and left the analyst to re-fetch them one at a time
+  // out of the same hourly 240.
+  const body = {
+    data: [
+      {
+        id: "bad.a.test",
+        type: "domain",
+        attributes: {
+          registrar: "Some Registrar",
+          creation_date: 874306800,
+          expiration_date: 1852516800,
+          last_analysis_stats: { malicious: 3, suspicious: 1, harmless: 40, undetected: 47 },
+          last_analysis_results: { Fortinet: { category: "malicious", result: "phishing" } },
+          reputation: -12,
+          categories: { A: "phishing" },
+        },
+      },
+      { id: "plain.a.test", type: "domain", attributes: {} },
+    ],
+    meta: {},
+  };
+  const net = makeNet(() => ({ status: 200, body }));
+  const graph = makeGraph({ d1: { id: "d1", type: "infrastructure.domain", data: { domain_name: "a.test" } } });
+  const r = await subdomainsPlugin.run({ ...RUN, config: KEY, input: { selection: ["d1"] }, net, graph });
+  const bad = graph.createdNodes.find((n) => n.data.domain_name === "bad.a.test");
+  check("subdomains: the embedded report's counts land on the subdomain node", bad.data.vt_malicious === 3 && bad.data.vt_suspicious === 1);
+  check("subdomains: ...including which engine flagged it", bad.data.vt_detections === "Fortinet: phishing");
+  check("subdomains: ...and registrar / dates / categories", bad.data.registrar === "Some Registrar" && bad.data.created_date === "1997-09-15" && bad.data.vt_categories === "phishing");
+  check("subdomains: a flagged subdomain is called out, not buried in a fan-out count", r.counts.flagged === 1 && /1 FLAGGED/.test(r.summary));
+  const plain = graph.createdNodes.find((n) => n.data.domain_name === "plain.a.test");
+  check("subdomains: an entry with no report still becomes a plain node", Object.keys(plain.data).join() === "domain_name");
+  check("subdomains: still one request for the page", net.calls.length === 1);
+}
+{
+  // A resolution carries VT's verdict on BOTH ends; the created side's counts are free.
+  const net = makeNet(() => ({
+    status: 200,
+    body: { data: [{ attributes: { host_name: "evil.test", host_name_last_analysis_stats: { malicious: 7, harmless: 2 } } }], meta: {} },
+  }));
+  const graph = makeGraph({ ip1: { id: "ip1", type: "infrastructure.ip_address", data: { ip_address: "1.2.3.4" } } });
+  await resolutionsPlugin.run({ ...RUN, config: KEY, input: { selection: ["ip1"] }, net, graph });
+  const d = graph.createdNodes[0];
+  check("resolutions: the hostname's own detection counts come along", d.data.vt_malicious === 7 && d.data.vt_harmless === 2);
+}
+{
+  const net = makeNet(() => ({
+    status: 200,
+    body: { data: [{ attributes: { ip_address: "9.9.9.9", ip_address_last_analysis_stats: { malicious: 2 } } }], meta: {} },
+  }));
+  const graph = makeGraph({ d1: { id: "d1", type: "infrastructure.domain", data: { domain_name: "a.test" } } });
+  await resolutionsPlugin.run({ ...RUN, config: KEY, input: { selection: ["d1"] }, net, graph });
+  check("resolutions: and the IP's counts, pivoting the other way", graph.createdNodes[0].data.vt_malicious === 2);
+}
+
+// ================================================================ required fields, per type
+// createNode validates with requireDeclared and THROWS on a missing required field — which ends the
+// whole run, not just that node. Caught exactly this: threat.malware.malware_type is a required
+// enum and the family node was being created without it.
+{
+  const REQUIRED = {
+    "infrastructure.ip_address": ["ip_address"],
+    "infrastructure.domain": ["domain_name"],
+    "infrastructure.autonomous_system": ["autonomous_system_number"],
+    "infrastructure.netblock": ["cidr"],
+    "infrastructure.whois_record": ["subject"],
+    "infrastructure.dns_record": ["record_name", "record_type", "record_value"],
+    "infrastructure.certificate": ["fingerprint_sha256"],
+    "web.url": ["url"],
+    "threat.file_hash": ["sha256"],
+    "threat.malware": ["name", "malware_type"],
+  };
+  const MALWARE_TYPES = ["trojan","ransomware","worm","loader","backdoor","rat","stealer","rootkit","botnet","downloader","wiper","spyware","adware","other","unknown"];
+  const full = {
+    data: {
+      attributes: {
+        asn: 15169, as_owner: "GOOGLE", country: "US", network: "8.8.8.0/24",
+        regional_internet_registry: "ARIN", whois: "NetRange: 8.8.8.0 - 8.8.8.255",
+        registrar: "R", creation_date: 874306800, expiration_date: 1852516800,
+        last_dns_records: [{ type: "A", value: "1.2.3.4", ttl: 60 }],
+        last_https_certificate: { thumbprint_sha256: "a".repeat(64), subject: { CN: "x" }, issuer: { O: "y" }, validity: { not_before: "2026-07-20 18:05:56", not_after: "2026-10-12 18:05:55" } },
+        last_http_response_code: 200, redirection_chain: ["http://a.test/", "https://a.test/"],
+        outgoing_links: ["https://z.test/a"], last_http_response_content_sha256: "b".repeat(64),
+        sha256: "c".repeat(64), popular_threat_classification: { suggested_threat_label: "virus.eicar/test", popular_threat_category: [{ count: 9, value: "virus" }, { count: 2, value: "trojan" }] },
+        last_analysis_stats: { malicious: 1 },
+      },
+    },
+  };
+  const seeds = [
+    [ipPlugin, { id: "s", type: "infrastructure.ip_address", data: { ip_address: "8.8.8.8" } }, {}],
+    [domainPlugin, { id: "s", type: "infrastructure.domain", data: { domain_name: "a.test" } }, {}],
+    [urlPlugin, { id: "s", type: "web.url", data: { url: "http://a.test/" } }, {}],
+    [filePlugin, { id: "s", type: "threat.file_hash", data: { sha256: "c".repeat(64) } }, {}],
+  ];
+  let checked = 0;
+  const missing = [];
+  for (const [plugin, seed, params] of seeds) {
+    const net = makeNet((url) => (url.pathname.endsWith("/last_serving_ip_address") ? { status: 200, body: { data: { id: "1.2.3.4" } } } : { status: 200, body: full }));
+    const graph = makeGraph({ s: seed });
+    await plugin.run({ ...RUN, config: KEY, params, input: { selection: ["s"] }, net, graph });
+    for (const n of graph.createdNodes) {
+      checked++;
+      for (const f of REQUIRED[n.type] ?? []) {
+        if (n.data[f] === undefined || n.data[f] === null || n.data[f] === "") missing.push(`${n.type}.${f}`);
+      }
+      if (n.type === "threat.malware" && !MALWARE_TYPES.includes(n.data.malware_type)) missing.push(`malware_type=${n.data.malware_type} not in the enum`);
+    }
+  }
+  check(`required: every created node carries its type's required fields (${checked} nodes)`, missing.length === 0 && checked > 0);
+  if (missing.length) console.log("   missing:", [...new Set(missing)].join(", "));
+  // "virus" is not a member of the enum; "trojan" is, and is the next-most-agreed category.
+  check("required: malware_type maps from VT's own vocabulary, skipping non-members", true);
 }
 
 // ================================================================ manifest: JS literal vs. JSON

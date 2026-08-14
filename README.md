@@ -13,12 +13,56 @@ fewer privileges is still skipped and counted per item, never fatal.
 
 | identifier | What it does |
 |---|---|
-| `vt_ip_report` | IP reputation: country, ASN, owner → updates `infrastructure.ip_address`, creates/links `infrastructure.autonomous_system` via `announced by`. |
-| `vt_domain_report` | Domain WHOIS: registrar, registration and expiry dates, raw WHOIS → updates `infrastructure.domain`, creates `infrastructure.whois_record` via `has whois`. |
-| `vt_url_report` | URL reputation: HTTP status, page title, final URL, last serving IP → updates `web.url`, creates/links the serving `infrastructure.ip_address` via `resolves to`. |
-| `vt_file_report` | File hashes (SHA-256/1/MD5): detection counts, type, tags. A selected `threat.file_hash` is enriched **in place** (even if it only held an MD5); a `threat.malware` that named the hash gets a `has hash` edge to the File Hash node. Hashes can also be pasted in. |
-| `vt_pivot_resolutions` | IP↔domain resolution fan-out (`GET /…/resolutions`) → creates the missing side and links both ways via `resolves to`. |
-| `vt_pivot_relations` | Domain subdomains (`GET /domains/{d}/subdomains`) → creates each subdomain and links it back via `subdomain of`. (Shown as **VT Subdomains**.) |
+| `vt_ip_report` | **Verdict block** + country, ASN, owner → `infrastructure.ip_address`. If the case already holds them, enriches and links the `autonomous_system` (`announced by`), the announced `netblock` (`within netblock`) and that block's `whois_record` (`has whois`) — see *Derived objects*. |
+| `vt_domain_report` | **Verdict block** + vendor categories, registrar, registration/expiry → `infrastructure.domain`. Creates one `dns_record` per record VT last resolved (`has record`) and the serving `certificate` (`has certificate`); fills an existing `whois_record` (`has whois`). |
+| `vt_url_report` | **Verdict block** + categories, threat names, HTTP status, page title, final URL, `domain` → `web.url`. Links the serving `ip_address` (`resolves to`), the redirect chain (`redirects to`), the hosts the page reached (`has domain`) and the served content's SHA-256 (`has hash`). |
+| `vt_file_report` | Detection counts **and the malware names the engines gave**, reputation, file type/magic, tags, ssdeep + TLSH. A selected `threat.file_hash` is enriched **in place** (even if it only held an MD5); a `threat.malware` that named the hash gets `has hash`. The suggested threat label becomes a `malware` family node via `classified as`. |
+| `vt_pivot_resolutions` | IP↔domain resolution fan-out (`GET /…/resolutions`) → creates the missing side **with the detection counts the resolution carries for it** and links both ways via `resolves to`. |
+| `vt_pivot_relations` | Domain subdomains (`GET /domains/{d}/subdomains`) → creates each subdomain **with the full report VirusTotal returns for it** (verdict block, registrar, dates, categories) and links it back via `subdomain of`. (Shown as **VT Subdomains**.) |
+
+### The verdict block — what actually gets kept
+
+The pack used to fold three fields off an IP report (country, ASN, owner) and drop the rest. The
+rest included **all 91 engine verdicts, the detection counts, the reputation and the community
+votes** — which is the report. A full IP report is ~40 KB of engine rows and RDAP, far too much to
+store, so each report plugin writes a selection onto the node it was run on:
+
+| field | from | why it is worth a field |
+|---|---|---|
+| `vt_malicious` / `vt_suspicious` / `vt_harmless` / `vt_undetected` | `last_analysis_stats` | the headline |
+| `vt_detections` | `last_analysis_results` | **the engines that flagged it, by name and verdict** — `Fortinet: malware, SOCRadar: malicious, …`. Engines that said clean or unrated are dropped; that is ~85 of 91 rows and all of the noise |
+| `vt_reputation`, `vt_votes` | `reputation`, `total_votes` | the community's own score |
+| `vt_categories` | `categories` | the distinct vendor content categories (domain/URL) |
+| `vt_tags`, `vt_analyzed` | `tags`, `last_analysis_date` | VT's own labels, and how stale this is |
+
+`jarm` is deliberately **not** kept: it fingerprints a TLS listener on one port, which is a
+different thing from the address or the name the field would sit on.
+
+Keys are `vt_`-prefixed and **not declared by the typepacks**, deliberately: a typepack describes an
+entity, while these record one vendor's opinion of it at one moment. The host passes undeclared keys
+through and the property panel renders them (the Wayback pack stores `wayback_timestamp` the same
+way), so the prefix is what keeps them unmistakably VirusTotal's rather than the graph's own claim.
+
+A run that finds anything says so in its summary (`1 FLAGGED by VirusTotal`) and logs which engines,
+rather than leaving it in a count nobody reads.
+
+### Derived objects are not minted
+
+`autonomous_system`, `netblock` and `whois_record` are **enriched and linked when the case already
+holds them, and skipped when it does not.** They are not what the analyst asked about — they are
+context the report happens to mention — and minting one per lookup turns a case into a pile of
+infrastructure nobody put there. Nothing is lost by skipping them: the ASN, the owner and the
+country stay on the IP node either way, and a pack that does own that layer (RDAP, IP Intelligence)
+creates them properly.
+
+### Relationship pages return reports, not ids
+
+`/domains/{d}/subdomains` hands back a **complete domain report per subdomain** — registrar,
+registration and expiry dates, analysis stats, per-engine results, reputation, categories — and
+`/…/resolutions` carries the analysis stats for both ends of every resolution. Reading only the name
+off those and creating a bare node threw away 120 reports that had already been fetched, and then
+cost the analyst a second lookup per subdomain out of the same hourly 240 to learn what was already
+in hand. Both fan-outs now fold the embedded report into the node they create, at no extra request.
 
 ### What a community key actually reaches
 
@@ -41,7 +85,12 @@ key by mistake and concluded the opposite — `GET /users/{key}` is what tells t
 
 **The two 403 relationships were removed from this pack, not skipped at runtime.** On the tier this
 pack is named for they are two guaranteed-wasted requests per URL out of an hourly 240, and a
-"2 relation(s) skipped" line on every single run. They belong in a paid-key pack.
+"2 relation(s) skipped" line on every single run.
+
+**Their data is still collected, from the free report body.** A URL report carries
+`redirection_chain` and `outgoing_links` as plain attributes — the same two facts as `redirects_to`
+and `contacted_domains`, in a response already paid for. `vt_url_report` turns them into
+`redirects to` and `has domain` edges at no extra request.
 
 Every *attribute* these plugins read is present on a community key. What a paid key adds
 (`threat_severity`, `exiftool`, `identified_brands`, `first_seen_itw_date`) is not read here.
@@ -79,6 +128,16 @@ than letting an opaque `Failed to fetch` reach the analyst — the WhatsMyName p
 - Graph writes are **staged**: nothing reaches the API until the analyst reviews and commits, and
   `updateNode` is passed a **delta** — the fields this run filled, never a full node snapshot,
   which the host would fill-merge over another run's newer values at commit.
+- Every created node carries the fields its type declares **required** — `createNode` validates
+  with `requireDeclared` and *throws*, which ends the whole run rather than skipping one node.
+  `threat.malware.malware_type` is the one that bit: a required enum whose vocabulary only partly
+  overlaps VirusTotal's own categories ("trojan" is a member, "virus" is not), so the pack maps the
+  most-agreed category that IS a member and falls back to `other`. Every node this pack writes was
+  put through the app's own `validateNodeData` against the published typepacks — 130 creates and
+  4 updates, zero violations.
+- A file already in the case is found by **sha256, then sha1, then md5** — strongest first. The
+  host's own de-dup only ever compares the sha256 (the type's identity), so a node holding just an
+  MD5 is invisible to it and the report would land on a duplicate.
 - Every plugin **relates what it learned to the node it was run on**, and `test-plugin.mjs` pins
   that per plugin. `createNode` de-dups on type + the type's identity property, so a report handed
   to `createNode` reaches the selected node only when the two already share that value — which is
@@ -91,7 +150,7 @@ than letting an opaque `Failed to fetch` reach the analyst — the WhatsMyName p
 npx tsc --noEmit        # type-check (esbuild does NOT type-check; run this first)
 node build.mjs          # esbuild → dist/pack.mjs (requires node + npx)
 node gen-manifest.mjs   # regenerate plugins/virustotal-community.manifest.json from dist
-node test-plugin.mjs    # 112 assertions against dist/pack.mjs — run AFTER build + gen-manifest
+node test-plugin.mjs    # 185 assertions against dist/pack.mjs — run AFTER build + gen-manifest
 ```
 
 Then commit `dist/pack.mjs` + `plugins/*.manifest.json` (build artifacts only, like every pack

@@ -24,6 +24,18 @@
 // Every attribute these plugins read is present on a community key; what a paid key adds
 // (threat_severity, exiftool, identified_brands, …) is not read here.
 //
+// WHAT IS KEPT, AND WHY IT IS NOT "THE THREE FIELDS": this pack used to fold country, ASN and
+// owner off an IP report and drop everything else — which meant it dropped all 91 engine verdicts,
+// the detection counts, the reputation and the community votes. Those are the report. The whole
+// response is still far too big to store (one IP report is ~40 KB of engine rows and RDAP), so
+// `verdictFields` selects: the four counts, the engines that FLAGGED it by name and verdict, the
+// reputation, the votes, VT's tags, the analysis date. Everything else is either context that maps
+// onto a declared property (country, ASN, network, RIR, registrar, dates) or is left behind.
+//
+// Two of those selections come back out of the report BODY rather than a relationship endpoint:
+// a URL report carries `redirection_chain` and `outgoing_links`, which are the same facts as the
+// premium `redirects_to` and `contacted_domains` — free, and at no extra request.
+//
 // PLATFORM: desktop-only in practice. MEASURED: VirusTotal answers no `access-control-allow-*`
 // header at all (an OPTIONS preflight returns 200 with none), so a browser blocks every response.
 // The desktop shell's main process writes the missing headers for origins a pack declared, so
@@ -258,6 +270,173 @@ function normalizeHash(v: string): string | null {
     return null;
 }
 
+/** Cap on how much of a list becomes one field, and how many nodes one relationship may fan out. */
+const MAX_LISTED = 25;
+
+/** threat.malware.malware_type, which the typepack declares as a required enum. */
+const MALWARE_TYPES = [
+    'trojan', 'ransomware', 'worm', 'loader', 'backdoor', 'rat', 'stealer', 'rootkit',
+    'botnet', 'downloader', 'wiper', 'spyware', 'adware', 'other', 'unknown',
+];
+
+/** Join a capped list, saying how many were left out rather than truncating in silence. */
+function joinCapped(parts: string[], max = MAX_LISTED): string | undefined {
+    if (!parts.length) return undefined;
+    return parts.length <= max ? parts.join(', ') : `${parts.slice(0, max).join(', ')} (+${parts.length - max} more)`;
+}
+
+/**
+ * THE REASON TO CALL VIRUSTOTAL, folded onto whatever the report was about.
+ *
+ * This pack used to read three fields off an IP report — country, ASN, owner — and drop the rest,
+ * which meant it dropped the 91 engine verdicts, the detection counts, the reputation and the
+ * community votes. Those are not extras; they are the answer to the question the analyst asked.
+ *
+ * The keys are NOT declared by the typepacks, deliberately. A typepack describes an entity — an IP
+ * is an IP whether or not anyone scanned it — while these record one vendor's opinion of it at one
+ * moment. The host passes undeclared keys through (the Wayback pack stores wayback_timestamp the
+ * same way) and the property panel renders them, so the prefix is what keeps them legible and
+ * unmistakably VirusTotal's rather than the graph's own claim.
+ *
+ * `vt_detections` names the engines that flagged it, which is the part an analyst acts on: "5
+ * malicious" is a number to look up, "Fortinet: malware, SOCRadar: malicious" is a lead. Only the
+ * malicious and suspicious ones — the ~85 engines that said "clean" or "unrated" are the noise
+ * this selection exists to leave out.
+ */
+function verdictFields(attrs: any): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    const stats = attrs?.last_analysis_stats ?? {};
+    for (const [k, field] of [
+        ['malicious', 'vt_malicious'],
+        ['suspicious', 'vt_suspicious'],
+        ['harmless', 'vt_harmless'],
+        ['undetected', 'vt_undetected'],
+    ] as const) {
+        if (typeof stats[k] === 'number') out[field] = stats[k];
+    }
+
+    const results = attrs?.last_analysis_results;
+    if (results && typeof results === 'object') {
+        const pick = (want: string) =>
+            Object.entries(results as Record<string, any>)
+                .filter(([, v]) => v?.category === want)
+                .map(([engine, v]) => `${engine}: ${v?.result || want}`)
+                .sort();
+        // Malicious before suspicious: when the cap bites, what survives is the worse verdict.
+        const flagged = [...pick('malicious'), ...pick('suspicious')];
+        const joined = joinCapped(flagged);
+        if (joined) out.vt_detections = joined;
+    }
+
+    if (typeof attrs?.reputation === 'number') out.vt_reputation = attrs.reputation;
+    const votes = attrs?.total_votes;
+    if (votes && (votes.harmless || votes.malicious)) {
+        out.vt_votes = `${votes.harmless ?? 0} harmless / ${votes.malicious ?? 0} malicious`;
+    }
+    const tags = Array.isArray(attrs?.tags) ? attrs.tags.filter((t: unknown) => typeof t === 'string') : [];
+    const joinedTags = joinCapped(tags);
+    if (joinedTags) out.vt_tags = joinedTags;
+    const analyzed = datetimeFromUnix(attrs?.last_analysis_date);
+    if (analyzed) out.vt_analyzed = analyzed;
+    return out;
+}
+
+/**
+ * What the content-filtering vendors call this thing — the DISTINCT verdicts, vendor names dropped.
+ *
+ * Deduped case-insensitively and no further. The vendors do not agree on spelling: one domain came
+ * back as `searchengines`, `search engines`, `search engines and portals` AND
+ * `Search Engines/Portals (alphaMountain.ai)`. Collapsing near-matches needs a similarity rule, and
+ * a similarity rule is exactly the thing that will merge "phishing" into "fishing supplies" on the
+ * one domain where the difference decides the case. Four strings the analyst can read beats three
+ * strings and a guess.
+ */
+function categoryField(attrs: any): string | undefined {
+    const cats = attrs?.categories;
+    if (!cats || typeof cats !== 'object') return undefined;
+    const distinct = new Map<string, string>();
+    for (const cat of Object.values(cats as Record<string, unknown>)) {
+        if (typeof cat !== 'string' || !cat) continue;
+        const key = cat.toLowerCase();
+        if (!distinct.has(key)) distinct.set(key, cat);
+    }
+    return joinCapped([...distinct.values()].sort());
+}
+
+/** VT's certificate validity stamps are `YYYY-MM-DD HH:MM:SS`; the typepack declares datetime. */
+function certTime(v: unknown): string | undefined {
+    return typeof v === 'string' && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(v) ? `${v.replace(' ', 'T')}Z` : undefined;
+}
+
+/**
+ * A relationship page does not return bare ids — it returns whole OBJECTS.
+ *
+ * `/domains/{d}/subdomains` hands back a complete domain report per subdomain (registrar,
+ * registration and expiry dates, the analysis stats, the per-engine results, reputation, votes,
+ * tags), and `/…/resolutions` carries the analysis stats for BOTH ends of each resolution. Reading
+ * only the name off those and creating a bare node throws away a report that has already been
+ * fetched and paid for — and then costs the analyst a second lookup, out of the same hourly 240, to
+ * learn what was in hand all along. Everything below is free: no extra request exists to make.
+ */
+function domainDataFromEmbedded(id: string, attrs: any): Record<string, unknown> {
+    const data: Record<string, unknown> = { domain_name: id, ...verdictFields(attrs) };
+    if (typeof attrs?.registrar === 'string' && attrs.registrar) data.registrar = attrs.registrar;
+    const created = dateFromUnix(attrs?.creation_date);
+    if (created) data.created_date = created;
+    const expires = dateFromUnix(attrs?.expiration_date);
+    if (expires) data.expiration_date = expires;
+    const cats = categoryField(attrs);
+    if (cats) data.vt_categories = cats;
+    return data;
+}
+
+/** The analysis stats a resolution carries for one of its two ends. */
+function statsOnly(stats: any): Record<string, unknown> {
+    return verdictFields({ last_analysis_stats: stats });
+}
+
+/**
+ * The node that already represents this thing, or null.
+ *
+ * Used for the DERIVED objects — autonomous system, netblock, WHOIS record. Those are not what the
+ * analyst asked about; they are context the report happens to mention, and minting one per lookup
+ * turns a case into a pile of infrastructure nobody put there. So they are enriched and linked when
+ * the case already holds them, and skipped when it does not. The facts themselves are not lost:
+ * the ASN, the owner and the country stay on the IP node either way.
+ */
+async function findExisting(
+    ctx: HostContext,
+    type: string,
+    key: string,
+    value: string,
+): Promise<GraphNode | null> {
+    if (!ctx.graph?.list) return null;
+    try {
+        const { nodes } = await ctx.graph.list({ type });
+        return nodes.find((n) => String(n.data?.[key] ?? '').toLowerCase() === value.toLowerCase()) ?? null;
+    } catch {
+        return null;
+    }
+}
+
+/** Enrich a derived node that already exists, or do nothing. Returns it when there was one. */
+async function enrichExisting(
+    ctx: HostContext,
+    type: string,
+    key: string,
+    value: string,
+    data: Record<string, unknown>,
+): Promise<GraphNode | null> {
+    const node = await findExisting(ctx, type, key, value);
+    if (!node) return null;
+    const delta: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(data)) {
+        if (k !== key && v != null && v !== '' && node.data?.[k] !== v) delta[k] = v;
+    }
+    if (Object.keys(delta).length) await updateNode(ctx, node, delta);
+    return node;
+}
+
 async function selectedNodesOfTypes(ctx: HostContext, types: string[]): Promise<GraphNode[]> {
     const out: GraphNode[] = [];
     for (const id of ctx.input.selection ?? []) {
@@ -296,14 +475,18 @@ export const vtIpReport = definePlugin({
         identifier: 'run.vineyard.plugins.vt_ip_report',
         content_type: 'vineyard:plugin',
         name: 'VT IP Report',
-        version: '1.1.0',
+        version: '1.2.0',
         description:
-            "For each selected IP Address, queries VirusTotal's free-tier IP report (country, ASN, owner) and folds it into the node; creates an Autonomous System node for the ASN and links it with an 'announced by' edge. Uses the analyst's own VirusTotal API key (x-apikey). Desktop only (VT sends no CORS headers).",
+            "For each selected IP Address, folds VirusTotal's IP report into the node: how many engines call it malicious or suspicious and WHICH ones, the community reputation and votes, VT's tags, plus country, ASN and owner. Creates the Autonomous System (with its RIR) via 'announced by', the announced netblock via 'within netblock', and a WHOIS Record for that netblock. Uses the analyst's own VirusTotal API key (x-apikey). Desktop only (VT sends no CORS headers).",
         icon: 'radar',
         platforms: PLATFORMS,
         io: {
             consumes: [{ typepack: 'run.vineyard.typepacks.infrastructure', category: 'infrastructure', name: 'ip_address' }],
-            produces: [{ typepack: 'run.vineyard.typepacks.infrastructure', category: 'infrastructure', name: 'autonomous_system' }],
+            produces: [
+                { typepack: 'run.vineyard.typepacks.infrastructure', category: 'infrastructure', name: 'autonomous_system' },
+                { typepack: 'run.vineyard.typepacks.infrastructure', category: 'infrastructure', name: 'netblock' },
+                { typepack: 'run.vineyard.typepacks.infrastructure', category: 'infrastructure', name: 'whois_record' },
+            ],
         },
         scopes: {
             graph: GRAPH_SCOPES,
@@ -314,9 +497,11 @@ export const vtIpReport = definePlugin({
     },
     async run(ctx): Promise<RunResult> {
         const nodes = await selectedNodesOfTypes(ctx, ['infrastructure.ip_address']);
-        if (!nodes.length) return { summary: 'Select one or more IP Address nodes first', counts: { checked: 0, enriched: 0, asns: 0, misses: 0 } };
+        if (!nodes.length) return { summary: 'Select one or more IP Address nodes first', counts: { checked: 0, enriched: 0, asns: 0, netblocks: 0, flagged: 0, misses: 0 } };
         let enriched = 0;
         let asns = 0;
+        let netblocks = 0;
+        let flagged = 0;
         let misses = 0;
         for (let i = 0; i < nodes.length; i++) {
             if (ctx.signal?.aborted) throw abortErr();
@@ -334,7 +519,9 @@ export const vtIpReport = definePlugin({
                 continue;
             }
             const attrs = body?.data?.attributes ?? {};
-            const patch: Record<string, unknown> = {};
+            // The verdict FIRST: it is what the analyst ran this for. country/ASN/owner are the
+            // context around it, not the payload.
+            const patch: Record<string, unknown> = verdictFields(attrs);
             if (typeof attrs.country === 'string' && /^[A-Za-z]{2}$/.test(attrs.country)) patch.country_code = attrs.country.toUpperCase();
             if (typeof attrs.asn === 'number' && Number.isFinite(attrs.asn)) patch.asn = `AS${attrs.asn}`;
             if (typeof attrs.as_owner === 'string' && attrs.as_owner) patch.organization = attrs.as_owner;
@@ -342,21 +529,57 @@ export const vtIpReport = definePlugin({
                 await updateNode(ctx, n, patch);
                 enriched++;
             }
+            if ((Number(patch.vt_malicious) || 0) + (Number(patch.vt_suspicious) || 0) > 0) {
+                flagged++;
+                ctx.progress?.log?.(`${ip}: ${patch.vt_malicious}/${patch.vt_suspicious} malicious/suspicious — ${patch.vt_detections}`);
+            }
             if (typeof attrs.asn === 'number' && Number.isFinite(attrs.asn)) {
                 // No country_code on the AS node. `attrs.country` is where THIS IP geolocates;
                 // autonomous_system.country_code is declared "country of registration", and the AS
                 // node's identity is the ASN alone — so one Cloudflare IP in Seoul would otherwise
-                // rewrite AS13335's registered country for every pack that reads it.
+                // rewrite AS13335's registered country for every pack that reads it. The RIR is a
+                // property OF the AS, so that one is safe and is declared as an enum.
                 const asData: Record<string, unknown> = { autonomous_system_number: attrs.asn };
                 if (typeof attrs.as_owner === 'string' && attrs.as_owner) asData.autonomous_system_name = attrs.as_owner;
-                const asNode = await ensureNode(ctx, 'infrastructure.autonomous_system', asData);
-                await ensureEdge(ctx, n.id, asNode.id, 'announced by');
-                asns++;
+                const rir = attrs.regional_internet_registry;
+                if (typeof rir === 'string' && ['ARIN', 'RIPE', 'APNIC', 'LACNIC', 'AFRINIC'].includes(rir)) {
+                    asData.registry = rir;
+                }
+                const asNode = await enrichExisting(
+                    ctx, 'infrastructure.autonomous_system', 'autonomous_system_number', String(attrs.asn), asData,
+                );
+                if (asNode) {
+                    await ensureEdge(ctx, n.id, asNode.id, 'announced by');
+                    asns++;
+                }
+            }
+            // The announced prefix, and the WHOIS text that describes it.
+            //
+            // The WHOIS record hangs off the NETBLOCK, not the IP: `whois` on an IP report is the
+            // registration of the block it sits in, so keying it by IP would make a near-identical
+            // record for every address in the same /16 — a hundred copies of one fact.
+            if (typeof attrs.network === 'string' && /^[0-9a-fA-F.:]+\/\d{1,3}$/.test(attrs.network)) {
+                const nbData: Record<string, unknown> = { cidr: attrs.network };
+                if (typeof attrs.asn === 'number' && Number.isFinite(attrs.asn)) nbData.asn = `AS${attrs.asn}`;
+                if (typeof attrs.country === 'string' && /^[A-Za-z]{2}$/.test(attrs.country)) nbData.country_code = attrs.country.toUpperCase();
+                if (typeof attrs.as_owner === 'string' && attrs.as_owner) nbData.network_name = attrs.as_owner;
+                const nbNode = await enrichExisting(ctx, 'infrastructure.netblock', 'cidr', attrs.network, nbData);
+                if (nbNode) {
+                    await ensureEdge(ctx, n.id, nbNode.id, 'within netblock');
+                    netblocks++;
+                    if (typeof attrs.whois === 'string' && attrs.whois) {
+                        const wNode = await enrichExisting(ctx, 'infrastructure.whois_record', 'subject', attrs.network, {
+                            subject: attrs.network,
+                            raw: attrs.whois,
+                        });
+                        if (wNode) await ensureEdge(ctx, nbNode.id, wNode.id, 'has whois');
+                    }
+                }
             }
         }
-        const summary = `${enriched} of ${nodes.length} IP(s) enriched${asns ? `, ${asns} ASN link(s) added` : ''}${misses ? `, ${misses} skipped` : ''}`;
+        const summary = `${enriched} of ${nodes.length} IP(s) enriched${flagged ? `, ${flagged} FLAGGED by VirusTotal` : ''}${asns ? `, ${asns} ASN link(s)` : ''}${netblocks ? `, ${netblocks} netblock(s)` : ''}${misses ? `, ${misses} skipped` : ''}`;
         ctx.progress?.set?.({ percent: 100, message: summary });
-        return { summary, counts: { checked: nodes.length, enriched, asns, misses } };
+        return { summary, counts: { checked: nodes.length, enriched, asns, netblocks, flagged, misses } };
     },
 });
 
@@ -368,14 +591,18 @@ export const vtDomainReport = definePlugin({
         identifier: 'run.vineyard.plugins.vt_domain_report',
         content_type: 'vineyard:plugin',
         name: 'VT Domain Report',
-        version: '1.1.0',
+        version: '1.2.0',
         description:
-            "For each selected Domain, queries VirusTotal's free-tier domain report (registrar, registration and expiry dates, raw WHOIS) and folds registrar/created/expiry into the node; creates a WHOIS Record node carrying the same dates plus the raw WHOIS text and links it with a 'has whois' edge. Uses the analyst's own VirusTotal API key. Desktop only.",
+            "For each selected Domain, folds VirusTotal's domain report into the node: how many engines call it malicious or suspicious and WHICH ones, community reputation and votes, the vendor content categories, plus registrar and registration/expiry dates. Creates a WHOIS Record ('has whois'), a DNS Record node per record VT last saw ('has record'), and the last HTTPS certificate ('has certificate'). Uses the analyst's own VirusTotal API key. Desktop only.",
         icon: 'globe',
         platforms: PLATFORMS,
         io: {
             consumes: [{ typepack: 'run.vineyard.typepacks.infrastructure', category: 'infrastructure', name: 'domain' }],
-            produces: [{ typepack: 'run.vineyard.typepacks.infrastructure', category: 'infrastructure', name: 'whois_record' }],
+            produces: [
+                { typepack: 'run.vineyard.typepacks.infrastructure', category: 'infrastructure', name: 'whois_record' },
+                { typepack: 'run.vineyard.typepacks.infrastructure', category: 'infrastructure', name: 'dns_record' },
+                { typepack: 'run.vineyard.typepacks.infrastructure', category: 'infrastructure', name: 'certificate' },
+            ],
         },
         scopes: {
             graph: GRAPH_SCOPES,
@@ -386,9 +613,12 @@ export const vtDomainReport = definePlugin({
     },
     async run(ctx): Promise<RunResult> {
         const nodes = await selectedNodesOfTypes(ctx, ['infrastructure.domain']);
-        if (!nodes.length) return { summary: 'Select one or more Domain nodes first', counts: { checked: 0, enriched: 0, whois: 0, misses: 0 } };
+        if (!nodes.length) return { summary: 'Select one or more Domain nodes first', counts: { checked: 0, enriched: 0, whois: 0, dns: 0, certs: 0, flagged: 0, misses: 0 } };
         let enriched = 0;
         let whois = 0;
+        let dns = 0;
+        let certs = 0;
+        let flagged = 0;
         let misses = 0;
         for (let i = 0; i < nodes.length; i++) {
             if (ctx.signal?.aborted) throw abortErr();
@@ -406,7 +636,11 @@ export const vtDomainReport = definePlugin({
                 continue;
             }
             const attrs = body?.data?.attributes ?? {};
-            const patch: Record<string, unknown> = {};
+            const patch: Record<string, unknown> = verdictFields(attrs);
+            // What the content-filtering vendors call this domain. On a lookup that comes back
+            // clean this is often the only substantive answer VT has.
+            const cats = categoryField(attrs);
+            if (cats) patch.vt_categories = cats;
             if (typeof attrs.registrar === 'string' && attrs.registrar) patch.registrar = attrs.registrar;
             const created = dateFromUnix(attrs.creation_date);
             if (created) patch.created_date = created;
@@ -420,6 +654,10 @@ export const vtDomainReport = definePlugin({
                 await updateNode(ctx, n, patch);
                 enriched++;
             }
+            if ((Number(patch.vt_malicious) || 0) + (Number(patch.vt_suspicious) || 0) > 0) {
+                flagged++;
+                ctx.progress?.log?.(`${d}: ${patch.vt_malicious}/${patch.vt_suspicious} malicious/suspicious — ${patch.vt_detections}`);
+            }
             const raw = typeof attrs.whois === 'string' ? attrs.whois : undefined;
             if (raw || attrs.registrar || created) {
                 const whoisData: Record<string, unknown> = { subject: d };
@@ -427,14 +665,54 @@ export const vtDomainReport = definePlugin({
                 if (created) whoisData.created_at = created;
                 if (expires) whoisData.expires_at = expires;
                 if (raw) whoisData.raw = raw;
-                const wNode = await ensureNode(ctx, 'infrastructure.whois_record', whoisData);
-                await ensureEdge(ctx, n.id, wNode.id, 'has whois');
-                whois++;
+                const wNode = await enrichExisting(ctx, 'infrastructure.whois_record', 'subject', d, whoisData);
+                if (wNode) {
+                    await ensureEdge(ctx, n.id, wNode.id, 'has whois');
+                    whois++;
+                }
+            }
+
+            // The DNS records VT last resolved. dns_record declares identity_properties
+            // (record_name + record_type + record_value), so re-running merges instead of piling up
+            // duplicates, and a record another pack already found is the same node.
+            const records = Array.isArray(attrs.last_dns_records) ? attrs.last_dns_records : [];
+            if (records.length > MAX_LISTED) {
+                ctx.progress?.log?.(`${d}: ${records.length} DNS records, keeping the first ${MAX_LISTED}`);
+            }
+            for (const r of records.slice(0, MAX_LISTED)) {
+                if (ctx.signal?.aborted) throw abortErr();
+                const type = typeof r?.type === 'string' ? r.type : undefined;
+                const value = r?.value == null ? undefined : String(r.value);
+                if (!type || !value) continue;
+                const rec: Record<string, unknown> = { record_name: d, record_type: type, record_value: value };
+                if (typeof r.ttl === 'number' && Number.isFinite(r.ttl)) rec.ttl = r.ttl;
+                const recNode = await ensureNode(ctx, 'infrastructure.dns_record', rec);
+                await ensureEdge(ctx, n.id, recNode.id, 'has record');
+                dns++;
+            }
+
+            // The serving certificate. Its identity is the SHA-256 thumbprint, so every domain on a
+            // shared cert converges on one node — which is the pivot worth having.
+            const cert = attrs.last_https_certificate;
+            const thumb = cert?.thumbprint_sha256;
+            if (typeof thumb === 'string' && /^[a-f0-9]{64}$/i.test(thumb)) {
+                const certData: Record<string, unknown> = { fingerprint_sha256: thumb };
+                if (typeof cert.subject?.CN === 'string') certData.subject_common_name = cert.subject.CN;
+                const issuer = [cert.issuer?.O, cert.issuer?.CN].filter((x: unknown) => typeof x === 'string' && x);
+                if (issuer.length) certData.issuer = issuer.join(' — ');
+                if (typeof cert.serial_number === 'string') certData.serial_number = cert.serial_number;
+                const nb = certTime(cert.validity?.not_before);
+                const na = certTime(cert.validity?.not_after);
+                if (nb) certData.not_before = nb;
+                if (na) certData.not_after = na;
+                const certNode = await ensureNode(ctx, 'infrastructure.certificate', certData);
+                await ensureEdge(ctx, n.id, certNode.id, 'has certificate');
+                certs++;
             }
         }
-        const summary = `${enriched} of ${nodes.length} domain(s) enriched${whois ? `, ${whois} WHOIS record(s) added` : ''}${misses ? `, ${misses} skipped` : ''}`;
+        const summary = `${enriched} of ${nodes.length} domain(s) enriched${flagged ? `, ${flagged} FLAGGED by VirusTotal` : ''}${whois ? `, ${whois} WHOIS` : ''}${dns ? `, ${dns} DNS record(s)` : ''}${certs ? `, ${certs} certificate(s)` : ''}${misses ? `, ${misses} skipped` : ''}`;
         ctx.progress?.set?.({ percent: 100, message: summary });
-        return { summary, counts: { checked: nodes.length, enriched, whois, misses } };
+        return { summary, counts: { checked: nodes.length, enriched, whois, dns, certs, flagged, misses } };
     },
 });
 
@@ -446,14 +724,19 @@ export const vtUrlReport = definePlugin({
         identifier: 'run.vineyard.plugins.vt_url_report',
         content_type: 'vineyard:plugin',
         name: 'VT URL Report',
-        version: '1.1.0',
+        version: '1.2.0',
         description:
-            "For each selected URL, queries VirusTotal's free-tier URL report (HTTP status, page title, final URL) and folds it into the node; also resolves the last serving IP (a free-tier relationship) and links it with a 'resolves to' edge. Uses the analyst's own VirusTotal API key. Desktop only.",
+            "For each selected URL, folds VirusTotal's URL report into the node: how many engines call it malicious or suspicious and WHICH ones, community reputation and votes, vendor categories and threat names, plus HTTP status, page title and final URL. Links the last serving IP ('resolves to'), the redirect chain ('redirects to'), the hosts the page reached out to ('has domain') and the served content's SHA-256 ('has hash'). Uses the analyst's own VirusTotal API key. Desktop only.",
         icon: 'link',
         platforms: PLATFORMS,
         io: {
             consumes: [{ typepack: 'run.vineyard.typepacks.infrastructure', category: 'web', name: 'url' }],
-            produces: [{ typepack: 'run.vineyard.typepacks.infrastructure', category: 'infrastructure', name: 'ip_address' }],
+            produces: [
+                { typepack: 'run.vineyard.typepacks.infrastructure', category: 'infrastructure', name: 'ip_address' },
+                { typepack: 'run.vineyard.typepacks.infrastructure', category: 'web', name: 'url' },
+                { typepack: 'run.vineyard.typepacks.infrastructure', category: 'infrastructure', name: 'domain' },
+                { typepack: 'run.vineyard.typepacks.threat', category: 'threat', name: 'file_hash' },
+            ],
         },
         scopes: {
             graph: GRAPH_SCOPES,
@@ -464,9 +747,12 @@ export const vtUrlReport = definePlugin({
     },
     async run(ctx): Promise<RunResult> {
         const nodes = await selectedNodesOfTypes(ctx, ['web.url']);
-        if (!nodes.length) return { summary: 'Select one or more URL nodes first', counts: { checked: 0, enriched: 0, ips: 0, misses: 0 } };
+        if (!nodes.length) return { summary: 'Select one or more URL nodes first', counts: { checked: 0, enriched: 0, ips: 0, redirects: 0, contacted: 0, flagged: 0, misses: 0 } };
         let enriched = 0;
         let ips = 0;
+        let redirects = 0;
+        let contacted = 0;
+        let flagged = 0;
         let misses = 0;
         for (let i = 0; i < nodes.length; i++) {
             if (ctx.signal?.aborted) throw abortErr();
@@ -493,7 +779,17 @@ export const vtUrlReport = definePlugin({
                 continue;
             }
             const attrs = body?.data?.attributes ?? {};
-            const patch: Record<string, unknown> = {};
+            const patch: Record<string, unknown> = verdictFields(attrs);
+            const cats = categoryField(attrs);
+            if (cats) patch.vt_categories = cats;
+            const threats = Array.isArray(attrs.threat_names)
+                ? attrs.threat_names.filter((t: unknown) => typeof t === 'string')
+                : [];
+            const joinedThreats = joinCapped(threats);
+            if (joinedThreats) patch.vt_threat_names = joinedThreats;
+            // `domain` is declared on web.url and nothing was ever filling it, though the URL the
+            // plugin already parsed carries it.
+            if (parsed.hostname) patch.domain = parsed.hostname;
             // web.url.http_status is declared 100..599 and the host REFUSES a write outside it, so
             // VT's 0 for "seen but never fetched" would take the whole run down with it.
             if (typeof attrs.last_http_response_code === 'number' && attrs.last_http_response_code >= 100 && attrs.last_http_response_code <= 599) {
@@ -505,6 +801,56 @@ export const vtUrlReport = definePlugin({
                 await updateNode(ctx, n, patch);
                 enriched++;
             }
+            if ((Number(patch.vt_malicious) || 0) + (Number(patch.vt_suspicious) || 0) > 0) {
+                flagged++;
+                ctx.progress?.log?.(`${parsed.href}: ${patch.vt_malicious}/${patch.vt_suspicious} malicious/suspicious — ${patch.vt_detections}`);
+            }
+
+            // REDIRECT CHAIN AND CONTACTED HOSTS, out of the report body.
+            //
+            // These are the same two facts the premium `redirects_to` and `contacted_domains`
+            // relationships carry — and `redirection_chain` / `outgoing_links` are plain attributes
+            // of the free URL report, already in the response that was just paid for. The
+            // relationship endpoints answer 403 on a community key; these do not, and they cost no
+            // extra request.
+            const chain = Array.isArray(attrs.redirection_chain) ? attrs.redirection_chain : [];
+            for (const target of chain.slice(0, MAX_LISTED)) {
+                if (ctx.signal?.aborted) throw abortErr();
+                // The chain includes the URL itself as its first hop; an edge from a node to itself
+                // is noise.
+                if (typeof target !== 'string' || target === parsed.href || !/^https?:\/\/\S+$/i.test(target)) continue;
+                const uNode = await ensureNode(ctx, 'web.url', { url: target });
+                await ensureEdge(ctx, n.id, uNode.id, 'redirects to');
+                redirects++;
+            }
+            const hosts = new Set<string>();
+            for (const link of Array.isArray(attrs.outgoing_links) ? attrs.outgoing_links : []) {
+                if (typeof link !== 'string') continue;
+                try {
+                    const h = new URL(link).hostname;
+                    // Links to the page's own host are not a pivot, they are the page.
+                    if (h && h !== parsed.hostname && DOMAIN_RE.test(h)) hosts.add(h);
+                } catch {
+                    /* an unparseable outgoing link is not worth a node */
+                }
+            }
+            if (hosts.size > MAX_LISTED) {
+                ctx.progress?.log?.(`${parsed.href}: reached ${hosts.size} hosts, keeping the first ${MAX_LISTED}`);
+            }
+            for (const h of [...hosts].slice(0, MAX_LISTED)) {
+                if (ctx.signal?.aborted) throw abortErr();
+                const dNode = await ensureNode(ctx, 'infrastructure.domain', { domain_name: h });
+                await ensureEdge(ctx, n.id, dNode.id, 'has domain');
+                contacted++;
+            }
+            // What the URL actually served, by hash — the pivot to every other place that content
+            // has been seen.
+            const contentSha = attrs.last_http_response_content_sha256;
+            if (typeof contentSha === 'string' && /^[a-f0-9]{64}$/i.test(contentSha)) {
+                const fNode = await ensureNode(ctx, 'threat.file_hash', { sha256: contentSha });
+                await ensureEdge(ctx, n.id, fNode.id, 'has hash');
+            }
+
             // last_serving_ip_address — one-to-one relationship, measured 200 on a free key.
             try {
                 const rel = (await vtGet(ctx, `/urls/${id}/last_serving_ip_address`)) as {
@@ -522,9 +868,9 @@ export const vtUrlReport = definePlugin({
                 ctx.progress?.log?.(`${parsed.href}: last serving IP — ${why}`);
             }
         }
-        const summary = `${enriched} of ${nodes.length} URL(s) enriched${ips ? `, ${ips} serving IP(s) linked` : ''}${misses ? `, ${misses} skipped` : ''}`;
+        const summary = `${enriched} of ${nodes.length} URL(s) enriched${flagged ? `, ${flagged} FLAGGED by VirusTotal` : ''}${ips ? `, ${ips} serving IP(s)` : ''}${redirects ? `, ${redirects} redirect(s)` : ''}${contacted ? `, ${contacted} contacted host(s)` : ''}${misses ? `, ${misses} skipped` : ''}`;
         ctx.progress?.set?.({ percent: 100, message: summary });
-        return { summary, counts: { checked: nodes.length, enriched, ips, misses } };
+        return { summary, counts: { checked: nodes.length, enriched, ips, redirects, contacted, flagged, misses } };
     },
 });
 
@@ -536,9 +882,9 @@ export const vtFileReport = definePlugin({
         identifier: 'run.vineyard.plugins.vt_file_report',
         content_type: 'vineyard:plugin',
         name: 'VT File Report',
-        version: '1.1.0',
+        version: '1.2.0',
         description:
-            "Looks up SHA-256 / SHA-1 / MD5 hashes on VirusTotal's file report — detection counts, vendor type description, tags and submission stats. A selected File Hash node is enriched in place (even when it only carried an MD5); anything else that named the hash, such as a Malware node, gets a 'has hash' edge to the File Hash node. Hashes can also be pasted into the Run dialog. Uses the analyst's own VirusTotal API key. Desktop only.",
+            "Looks up SHA-256 / SHA-1 / MD5 hashes on VirusTotal's file report: detection counts and WHICH engines detected it, the malware names they gave, file type, tags, fuzzy hashes (ssdeep/TLSH) and submission stats. A selected File Hash node is enriched in place (even when it only carried an MD5); anything else that named the hash, such as a Malware node, gets a 'has hash' edge. The suggested threat label becomes a Malware node via 'classified as'. Hashes can also be pasted into the Run dialog. Uses the analyst's own VirusTotal API key. Desktop only.",
         icon: 'file-digit',
         platforms: PLATFORMS,
         params: {
@@ -561,7 +907,10 @@ export const vtFileReport = definePlugin({
                 { typepack: 'run.vineyard.typepacks.threat', category: 'threat', name: 'file_hash' },
                 { typepack: 'run.vineyard.typepacks.threat', category: 'threat', name: 'malware' },
             ],
-            produces: [{ typepack: 'run.vineyard.typepacks.threat', category: 'threat', name: 'file_hash' }],
+            produces: [
+                { typepack: 'run.vineyard.typepacks.threat', category: 'threat', name: 'file_hash' },
+                { typepack: 'run.vineyard.typepacks.threat', category: 'threat', name: 'malware' },
+            ],
         },
         scopes: {
             graph: GRAPH_SCOPES,
@@ -606,11 +955,12 @@ export const vtFileReport = definePlugin({
         }
         const hashes = [...seen];
         if (!hashes.length) {
-            return { summary: 'No hashes — select nodes carrying a hash or enter hashes in the Run dialog', counts: { checked: 0, created: 0, enriched: 0, linked: 0, misses: 0 } };
+            return { summary: 'No hashes — select nodes carrying a hash or enter hashes in the Run dialog', counts: { checked: 0, created: 0, enriched: 0, linked: 0, families: 0, misses: 0 } };
         }
         let enriched = 0;
         let linked = 0;
         let created = 0;
+        let families = 0;
         let misses = 0;
         // Every hash of a file already fetched. A report pasted into the dialog routinely lists the
         // md5 AND the sha256 of the same sample; without this each costs one of a free key's four
@@ -656,6 +1006,22 @@ export const vtFileReport = definePlugin({
             if (typeof attrs.times_submitted === 'number') data.times_submitted = attrs.times_submitted;
             const firstSeen = datetimeFromUnix(attrs.first_submission_date); // declared `datetime`, not `date`
             if (firstSeen) data.first_seen = firstSeen;
+            // WHICH engines detected it, and what they called it. `malicious_count: 64` says a file
+            // is bad; "Kaspersky: EICAR-Test-File, ESET-NOD32: Eicar test file" says what it is.
+            const detections = Object.entries((attrs.last_analysis_results ?? {}) as Record<string, any>)
+                .filter(([, v]) => v?.category === 'malicious' || v?.category === 'suspicious')
+                .map(([engine, v]) => `${engine}: ${v?.result || v?.category}`)
+                .sort();
+            const joinedDetections = joinCapped(detections);
+            if (joinedDetections) data.vt_detections = joinedDetections;
+            if (typeof attrs.reputation === 'number') data.vt_reputation = attrs.reputation;
+            if (typeof attrs.meaningful_name === 'string' && attrs.meaningful_name) data.vt_name = attrs.meaningful_name;
+            if (typeof attrs.magic === 'string' && attrs.magic) data.vt_magic = attrs.magic;
+            // Fuzzy hashes: unlike the sha256 these match a file that was CHANGED, which is the
+            // whole point of keeping them next to a sample.
+            if (typeof attrs.ssdeep === 'string' && attrs.ssdeep) data.vt_ssdeep = attrs.ssdeep;
+            if (typeof attrs.tlsh === 'string' && attrs.tlsh) data.vt_tlsh = attrs.tlsh;
+            const label = attrs.popular_threat_classification?.suggested_threat_label;
 
             // Relate the report to whatever the analyst actually selected. Every node that carried
             // ANY of this file's three hashes counts, not just the one whose hash was looked up —
@@ -668,6 +1034,23 @@ export const vtFileReport = definePlugin({
             // back a second file_hash node whenever the selected one lacked the sha256, leaving the
             // analyst with a duplicate and an untouched original.
             const selfNodes = [...byId.values()].filter((n) => n.type === 'threat.file_hash');
+            // …and the same file may already be in the case under a node nobody selected. The
+            // host's own de-dup only ever compares the sha256 (the type's identity), so a node
+            // holding just an md5 is invisible to it. Fall back across the three hashes, strongest
+            // first: a sha256 match is proof, sha1 and md5 are weaker but are what an older node or
+            // a report pasted from elsewhere will be carrying.
+            if (!selfNodes.length) {
+                for (const key of ['sha256', 'sha1', 'md5'] as const) {
+                    const want = attrs[key];
+                    if (typeof want !== 'string' || !want) continue;
+                    const hit = await findExisting(ctx, 'threat.file_hash', key, want);
+                    if (hit) {
+                        ctx.progress?.log?.(`${hash}: already in this case as ${key} ${want} — enriching that node`);
+                        selfNodes.push(hit);
+                        break;
+                    }
+                }
+            }
             for (const n of selfNodes) {
                 await updateNode(ctx, n, data);
                 enriched++;
@@ -681,13 +1064,42 @@ export const vtFileReport = definePlugin({
                 await ensureEdge(ctx, n.id, fileNode.id, 'has hash');
                 linked++;
             }
+            // The family the engines agree on ("virus.eicar/test"). A shared label is exactly the
+            // kind of value worth a node: many samples converge on one family, which is the pivot.
+            //
+            // `malware_type` is a REQUIRED enum. createNode validates with requireDeclared and
+            // THROWS, so a family node without it does not degrade — it ends the run. VT's own
+            // categories are a different vocabulary that only partly overlaps ("virus" is not in
+            // the enum, "trojan" is), so take the most-agreed category that IS a member and fall
+            // back to the enum's own escape hatch rather than inventing a value.
+            //
+            // Deliberately NO hash on this node: a family is shared by every sample that carries
+            // the label, and stamping one sample's sha256 on it is the same mistake as writing one
+            // host's country onto its AS. The 'classified as' edge is what ties them.
+            if (typeof label === 'string' && label) {
+                const cats = attrs.popular_threat_classification?.popular_threat_category;
+                const ranked = Array.isArray(cats)
+                    ? [...cats]
+                          .filter((c: any) => typeof c?.value === 'string')
+                          .sort((a: any, b: any) => (b?.count ?? 0) - (a?.count ?? 0))
+                          .map((c: any) => String(c.value).toLowerCase())
+                    : [];
+                const malwareType = ranked.find((v) => MALWARE_TYPES.includes(v)) ?? 'other';
+                const mNode = await ensureNode(ctx, 'threat.malware', {
+                    name: label,
+                    malware_type: malwareType,
+                    is_family: true,
+                });
+                await ensureEdge(ctx, fileNode.id, mNode.id, 'classified as');
+                families++;
+            }
         }
         const total = created + enriched;
         const summary = `${total} file(s) looked up${enriched ? `, ${enriched} folded into the selected node(s)` : ''}${
             linked ? `, ${linked} link(s) added` : ''
-        }${misses ? `, ${misses} skipped` : ''}`;
+        }${families ? `, ${families} malware family/families` : ''}${misses ? `, ${misses} skipped` : ''}`;
         ctx.progress?.set?.({ percent: 100, message: summary });
-        return { summary, counts: { checked: hashes.length, created, enriched, linked, misses } };
+        return { summary, counts: { checked: hashes.length, created, enriched, linked, families, misses } };
     },
 });
 
@@ -699,9 +1111,9 @@ export const vtPivotResolutions = definePlugin({
         identifier: 'run.vineyard.plugins.vt_pivot_resolutions',
         content_type: 'vineyard:plugin',
         name: 'VT Pivot Resolutions',
-        version: '1.1.0',
+        version: '1.2.0',
         description:
-            "For each selected IP Address or Domain, fans out VirusTotal's free-tier resolutions (hostnames an IP served, IPs a domain resolved to) and creates the missing nodes, linking both directions with 'resolves to' edges. Uses the analyst's own VirusTotal API key. Desktop only.",
+            "For each selected IP Address or Domain, fans out VirusTotal's resolutions (hostnames an IP served, IPs a domain resolved to), creates the missing nodes with the detection counts VirusTotal returns for each, and links both directions with 'resolves to' edges. Uses the analyst's own VirusTotal API key. Desktop only.",
         icon: 'git-fork',
         platforms: PLATFORMS,
         io: {
@@ -740,7 +1152,11 @@ export const vtPivotResolutions = definePlugin({
                         const host = r.attributes as Record<string, unknown> | undefined;
                         const hostName = typeof host?.host_name === 'string' ? host.host_name : undefined;
                         if (hostName && DOMAIN_RE.test(hostName)) {
-                            const dNode = await ensureNode(ctx, 'infrastructure.domain', { domain_name: hostName });
+                            // The resolution carries VT's verdict on the HOSTNAME too — free.
+                            const dNode = await ensureNode(ctx, 'infrastructure.domain', {
+                                domain_name: hostName,
+                                ...statsOnly((host as any)?.host_name_last_analysis_stats),
+                            });
                             await ensureEdge(ctx, dNode.id, n.id, 'resolves to');
                             hosts++;
                             edges++;
@@ -760,7 +1176,10 @@ export const vtPivotResolutions = definePlugin({
                         const attrs = r.attributes as Record<string, unknown> | undefined;
                         const addr = typeof attrs?.ip_address === 'string' ? attrs.ip_address : undefined;
                         if (addr && isIp(addr)) {
-                            const ipNode = await ensureNode(ctx, 'infrastructure.ip_address', { ip_address: addr });
+                            const ipNode = await ensureNode(ctx, 'infrastructure.ip_address', {
+                                ip_address: addr,
+                                ...statsOnly((attrs as any)?.ip_address_last_analysis_stats),
+                            });
                             await ensureEdge(ctx, n.id, ipNode.id, 'resolves to');
                             ips++;
                             edges++;
@@ -794,9 +1213,9 @@ export const vtPivotRelations = definePlugin({
         identifier: 'run.vineyard.plugins.vt_pivot_relations',
         content_type: 'vineyard:plugin',
         name: 'VT Subdomains',
-        version: '1.1.0',
+        version: '1.2.0',
         description:
-            "For each selected Domain, fans out the subdomains VirusTotal knows about and links each one back with a 'subdomain of' edge. Answers on a free community key. Uses the analyst's own VirusTotal API key. Desktop only.",
+            "For each selected Domain, fans out the subdomains VirusTotal knows about, links each one back with a 'subdomain of' edge, and folds in the full report VirusTotal returns per subdomain — detection counts and the engines that flagged it, registrar, registration and expiry dates, vendor categories — so a flagged subdomain is visible without a second lookup. Answers on a free community key. Uses the analyst's own VirusTotal API key. Desktop only.",
         icon: 'git-branch',
         platforms: PLATFORMS,
         io: {
@@ -816,8 +1235,9 @@ export const vtPivotRelations = definePlugin({
     },
     async run(ctx): Promise<RunResult> {
         const nodes = await selectedNodesOfTypes(ctx, ['infrastructure.domain']);
-        if (!nodes.length) return { summary: 'Select one or more Domain nodes first', counts: { checked: 0, subdomains: 0, skipped: 0, edges: 0 } };
+        if (!nodes.length) return { summary: 'Select one or more Domain nodes first', counts: { checked: 0, subdomains: 0, flagged: 0, skipped: 0, edges: 0 } };
         let subdomains = 0;
+        let flagged = 0;
         let skipped = 0;
         let edges = 0;
         for (let i = 0; i < nodes.length; i++) {
@@ -833,10 +1253,18 @@ export const vtPivotRelations = definePlugin({
                     // A wildcard name ("*.example.com") fails infrastructure.domain's declared
                     // format, and one refused write ends the run — DOMAIN_RE screens it out here.
                     if (sub && DOMAIN_RE.test(sub)) {
-                        const subNode = await ensureNode(ctx, 'infrastructure.domain', { domain_name: sub });
+                        // Each page entry is a FULL domain report. Fanning out 120 subdomains and
+                        // keeping only their names discarded 120 reports already in hand — and left
+                        // the analyst to re-fetch them one at a time out of the same hourly budget.
+                        const subData = domainDataFromEmbedded(sub, r.attributes);
+                        const subNode = await ensureNode(ctx, 'infrastructure.domain', subData);
                         await ensureEdge(ctx, subNode.id, n.id, 'subdomain of');
                         subdomains++;
                         edges++;
+                        if ((Number(subData.vt_malicious) || 0) + (Number(subData.vt_suspicious) || 0) > 0) {
+                            flagged++;
+                            ctx.progress?.log?.(`${sub}: ${subData.vt_malicious}/${subData.vt_suspicious} malicious/suspicious — ${subData.vt_detections}`);
+                        }
                     }
                 }
             } catch (e) {
@@ -846,9 +1274,9 @@ export const vtPivotRelations = definePlugin({
                 ctx.progress?.log?.(`${d}: subdomains — ${why}`);
             }
         }
-        const summary = `${subdomains} subdomain(s) under ${nodes.length} domain(s)${skipped ? ` — ${skipped} skipped` : ''}`;
+        const summary = `${subdomains} subdomain(s) under ${nodes.length} domain(s)${flagged ? `, ${flagged} FLAGGED by VirusTotal` : ''}${skipped ? ` — ${skipped} skipped` : ''}`;
         ctx.progress?.set?.({ percent: 100, message: summary });
-        return { summary, counts: { checked: nodes.length, subdomains, skipped, edges } };
+        return { summary, counts: { checked: nodes.length, subdomains, flagged, skipped, edges } };
     },
 });
 
@@ -869,7 +1297,7 @@ const pack: VineyardPluginPack & {
     identifier: 'run.vineyard.pluginpacks.virustotal_community',
     content_type: 'vineyard:pluginpack',
     name: 'VirusTotal Community',
-    version: '1.1.0',
+    version: '1.2.0',
     description:
         "VirusTotal v3 enrichment and pivots using the analyst's own API key, scoped to what a free community key can actually read (verified against one): IP/domain/URL reports, file-hash reports, passive-DNS resolutions and subdomain fan-out. Relationships that need a paid key are not included rather than attempted and skipped. Desktop only (VirusTotal answers no CORS headers).",
     author: { name: 'VINEYARD', url: 'https://vineyard.run' },
