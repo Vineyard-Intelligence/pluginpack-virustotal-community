@@ -33,7 +33,7 @@ function makeGraph(nodeById) {
     async get(id) {
       return nodeById[id] || null;
     },
-    // The derived-object rule (AS / netblock / WHOIS) asks the case what it already holds.
+    // The derived-object rule (AS / netblock / WHOIS) asks the project what it already holds.
     async list(o) {
       const all = [...Object.values(nodeById), ...createdNodes];
       return { nodes: o?.type ? all.filter((n) => n.type === o.type) : all };
@@ -164,9 +164,9 @@ const vtErr = (code, message) => ({ error: { code, message } });
   // along — the host fill-merges the delta onto LIVE at commit, so a stale value rolls back
   // whatever another run wrote in between.
   check("ip: no field the run did not fill is echoed back", !("reverse_dns" in graph.updates[0].data) && !("ip_address" in graph.updates[0].data));
-  // DERIVED objects are context, not the answer. A case that does not already hold this AS does not
+  // DERIVED objects are context, not the answer. A project that does not already hold this AS does not
   // get one minted for it — the ASN and owner are on the IP node either way.
-  check("ip: no AS node is invented when the case has none", !graph.createdNodes.some((n) => n.type === "infrastructure.autonomous_system"));
+  check("ip: no AS node is invented when the project has none", !graph.createdNodes.some((n) => n.type === "infrastructure.autonomous_system"));
   check("ip: ...and no edge to one either", graph.createdEdges.length === 0);
   check("ip: the ASN and owner are still on the IP node", graph.updates[0].data.asn === "AS15169" && graph.updates[0].data.organization === "GOOGLE");
 }
@@ -203,7 +203,7 @@ const vtErr = (code, message) => ({ error: { code, message } });
 }
 
 {
-  // …and when the case DOES hold them, they are enriched and linked instead of duplicated.
+  // …and when the project DOES hold them, they are enriched and linked instead of duplicated.
   const body = { data: { attributes: {
     country: "kr", asn: 45996, as_owner: "DAOU TECHNOLOGY", regional_internet_registry: "APNIC",
     network: "27.102.0.0/16", whois: "inetnum: 27.102.0.0 - 27.102.255.255",
@@ -228,7 +228,7 @@ const vtErr = (code, message) => ({ error: { code, message } });
   check("derived: ...and hangs off the netblock, not the address", graph.createdEdges.some((e) => e.from === "nb1" && e.to === "w1" && e.label === "has whois"));
 }
 {
-  // A netblock the case does not hold means its WHOIS has nothing to hang from either.
+  // A netblock the project does not hold means its WHOIS has nothing to hang from either.
   const body = { data: { attributes: { asn: 1, network: "10.0.0.0/8", whois: "x" } } };
   const net = makeNet(() => ({ status: 200, body }));
   const graph = makeGraph({ ip1: { id: "ip1", type: "infrastructure.ip_address", data: { ip_address: "10.0.0.1" } } });
@@ -259,7 +259,7 @@ const vtErr = (code, message) => ({ error: { code, message } });
   check("domain: registrar and creation date folded into the node", upd.registrar === "MarkMonitor Inc." && upd.created_date === "1997-09-15");
   check("domain: expiry comes from the expiration_date FIELD, not a WHOIS-text regex", upd.expiration_date === "2028-09-14");
   check("domain: the update is a delta", Object.keys(upd).join() === "registrar,created_date,expiration_date");
-  check("domain: no WHOIS node is invented when the case has none", !graph.createdNodes.some((n) => n.type === "infrastructure.whois_record"));
+  check("domain: no WHOIS node is invented when the project has none", !graph.createdNodes.some((n) => n.type === "infrastructure.whois_record"));
 }
 
 {
@@ -435,7 +435,7 @@ const vtErr = (code, message) => ({ error: { code, message } });
 }
 
 {
-  // The same file already in the case under a node nobody selected, holding only its MD5. The
+  // The same file already in the project under a node nobody selected, holding only its MD5. The
   // host's own de-dup compares the sha256 alone (the type's identity), so that node is invisible
   // to it — the report would land on a second, duplicate file_hash node.
   const attrs = {
@@ -467,11 +467,11 @@ const vtErr = (code, message) => ({ error: { code, message } });
   check("file: the sha256 match wins over an md5-only match", graph.updates.length === 1 && graph.updates[0].id === "strong");
 }
 {
-  // A file genuinely new to the case still gets a node.
+  // A file genuinely new to the project still gets a node.
   const net = makeNet(() => ({ status: 200, body: { data: { attributes: { sha256: "9".repeat(64) } } } }));
   const graph = makeGraph({});
   const r = await filePlugin.run({ ...RUN, config: KEY, params: { hashes: "9".repeat(64) }, input: { selection: [] }, net, graph });
-  check("file: a file the case has never seen is still created", r.counts.created === 1 && graph.createdNodes.some((n) => n.type === "threat.file_hash"));
+  check("file: a file the project has never seen is still created", r.counts.created === 1 && graph.createdNodes.some((n) => n.type === "threat.file_hash"));
 }
 
 // ================================================================ vt_pivot_resolutions
@@ -547,7 +547,7 @@ const vtErr = (code, message) => ({ error: { code, message } });
   const net = makeNet(() => ({ status: 200, body }));
   const graph = makeGraph({
     ip1: { id: "ip1", type: "infrastructure.ip_address", data: { ip_address: "27.102.137.126" } },
-    // Present in the case already, so the derived half of the report has somewhere to land.
+    // Present in the project already, so the derived half of the report has somewhere to land.
     as1: { id: "as1", type: "infrastructure.autonomous_system", data: { autonomous_system_number: 45996 } },
     nb1: { id: "nb1", type: "infrastructure.netblock", data: { cidr: "27.102.0.0/16" } },
     w1: { id: "w1", type: "infrastructure.whois_record", data: { subject: "27.102.0.0/16" } },
