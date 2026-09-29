@@ -13,7 +13,7 @@ fewer privileges is still skipped and counted per item, never fatal.
 
 | identifier | What it does |
 |---|---|
-| `vt_ip_report` | **Verdict block** + country, ASN, owner → `infrastructure.ip_address`. If the case already holds them, enriches and links the `autonomous_system` (`announced by`), the announced `netblock` (`within netblock`) and that block's `whois_record` (`has whois`) — see *Derived objects*. |
+| `vt_ip_report` | **Verdict block** + country, ASN, owner → `infrastructure.ip_address`. If the project already holds them, enriches and links the `autonomous_system` (`announced by`), the announced `netblock` (`within netblock`) and that block's `whois_record` (`has whois`) — see *Derived objects*. |
 | `vt_domain_report` | **Verdict block** + vendor categories, registrar, registration/expiry → `infrastructure.domain`. Creates one `dns_record` per record VT last resolved (`has record`) and the serving `certificate` (`has certificate`); fills an existing `whois_record` (`has whois`). |
 | `vt_url_report` | **Verdict block** + categories, threat names, HTTP status, page title, final URL, `domain` → `web.url`. Links the serving `ip_address` (`resolves to`), the redirect chain (`redirects to`), the hosts the page reached (`has domain`) and the served content's SHA-256 (`has hash`). |
 | `vt_file_report` | Detection counts **and the malware names the engines gave**, reputation, file type/magic, tags, ssdeep + TLSH. A selected `threat.file_hash` is enriched **in place** (even if it only held an MD5); a `threat.malware` that named the hash gets `has hash`. The suggested threat label becomes a `malware` family node via `classified as`. |
@@ -48,9 +48,9 @@ rather than leaving it in a count nobody reads.
 
 ### Derived objects are not minted
 
-`autonomous_system`, `netblock` and `whois_record` are **enriched and linked when the case already
+`autonomous_system`, `netblock` and `whois_record` are **enriched and linked when the project already
 holds them, and skipped when it does not.** They are not what the analyst asked about — they are
-context the report happens to mention — and minting one per lookup turns a case into a pile of
+context the report happens to mention — and minting one per lookup turns a project into a pile of
 infrastructure nobody put there. Nothing is lost by skipping them: the ASN, the owner and the
 country stay on the IP node either way, and a pack that does own that layer (RDAP, IP Intelligence)
 creates them properly.
@@ -135,7 +135,7 @@ than letting an opaque `Failed to fetch` reach the analyst — the WhatsMyName p
   most-agreed category that IS a member and falls back to `other`. Every node this pack writes was
   put through the app's own `validateNodeData` against the published typepacks — 130 creates and
   4 updates, zero violations.
-- A file already in the case is found by **sha256, then sha1, then md5** — strongest first. The
+- A file already in the project is found by **sha256, then sha1, then md5** — strongest first. The
   host's own de-dup only ever compares the sha256 (the type's identity), so a node holding just an
   MD5 is invisible to it and the report would land on a duplicate.
 - Every plugin **relates what it learned to the node it was run on**, and `test-plugin.mjs` pins

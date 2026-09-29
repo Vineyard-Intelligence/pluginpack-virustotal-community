@@ -400,8 +400,8 @@ function statsOnly(stats: any): Record<string, unknown> {
  *
  * Used for the DERIVED objects — autonomous system, netblock, WHOIS record. Those are not what the
  * analyst asked about; they are context the report happens to mention, and minting one per lookup
- * turns a case into a pile of infrastructure nobody put there. So they are enriched and linked when
- * the case already holds them, and skipped when it does not. The facts themselves are not lost:
+ * turns a project into a pile of infrastructure nobody put there. So they are enriched and linked when
+ * the project already holds them, and skipped when it does not. The facts themselves are not lost:
  * the ASN, the owner and the country stay on the IP node either way.
  */
 async function findExisting(
@@ -475,7 +475,7 @@ export const vtIpReport = definePlugin({
         identifier: 'run.vineyard.plugins.vt_ip_report',
         content_type: 'vineyard:plugin',
         name: 'VT IP Report',
-        version: '1.2.0',
+        version: '1.2.1',
         description:
             "For each selected IP Address, folds VirusTotal's IP report into the node: how many engines call it malicious or suspicious and WHICH ones, the community reputation and votes, VT's tags, plus country, ASN and owner. Creates the Autonomous System (with its RIR) via 'announced by', the announced netblock via 'within netblock', and a WHOIS Record for that netblock. Uses the analyst's own VirusTotal API key (x-apikey). Desktop only (VT sends no CORS headers).",
         icon: 'radar',
@@ -591,7 +591,7 @@ export const vtDomainReport = definePlugin({
         identifier: 'run.vineyard.plugins.vt_domain_report',
         content_type: 'vineyard:plugin',
         name: 'VT Domain Report',
-        version: '1.2.0',
+        version: '1.2.1',
         description:
             "For each selected Domain, folds VirusTotal's domain report into the node: how many engines call it malicious or suspicious and WHICH ones, community reputation and votes, the vendor content categories, plus registrar and registration/expiry dates. Creates a WHOIS Record ('has whois'), a DNS Record node per record VT last saw ('has record'), and the last HTTPS certificate ('has certificate'). Uses the analyst's own VirusTotal API key. Desktop only.",
         icon: 'globe',
@@ -724,7 +724,7 @@ export const vtUrlReport = definePlugin({
         identifier: 'run.vineyard.plugins.vt_url_report',
         content_type: 'vineyard:plugin',
         name: 'VT URL Report',
-        version: '1.2.0',
+        version: '1.2.1',
         description:
             "For each selected URL, folds VirusTotal's URL report into the node: how many engines call it malicious or suspicious and WHICH ones, community reputation and votes, vendor categories and threat names, plus HTTP status, page title and final URL. Links the last serving IP ('resolves to'), the redirect chain ('redirects to'), the hosts the page reached out to ('has domain') and the served content's SHA-256 ('has hash'). Uses the analyst's own VirusTotal API key. Desktop only.",
         icon: 'link',
@@ -882,7 +882,7 @@ export const vtFileReport = definePlugin({
         identifier: 'run.vineyard.plugins.vt_file_report',
         content_type: 'vineyard:plugin',
         name: 'VT File Report',
-        version: '1.2.0',
+        version: '1.2.1',
         description:
             "Looks up SHA-256 / SHA-1 / MD5 hashes on VirusTotal's file report: detection counts and WHICH engines detected it, the malware names they gave, file type, tags, fuzzy hashes (ssdeep/TLSH) and submission stats. A selected File Hash node is enriched in place (even when it only carried an MD5); anything else that named the hash, such as a Malware node, gets a 'has hash' edge. The suggested threat label becomes a Malware node via 'classified as'. Hashes can also be pasted into the Run dialog. Uses the analyst's own VirusTotal API key. Desktop only.",
         icon: 'file-digit',
@@ -1034,7 +1034,7 @@ export const vtFileReport = definePlugin({
             // back a second file_hash node whenever the selected one lacked the sha256, leaving the
             // analyst with a duplicate and an untouched original.
             const selfNodes = [...byId.values()].filter((n) => n.type === 'threat.file_hash');
-            // …and the same file may already be in the case under a node nobody selected. The
+            // …and the same file may already be in the project under a node nobody selected. The
             // host's own de-dup only ever compares the sha256 (the type's identity), so a node
             // holding just an md5 is invisible to it. Fall back across the three hashes, strongest
             // first: a sha256 match is proof, sha1 and md5 are weaker but are what an older node or
@@ -1045,7 +1045,7 @@ export const vtFileReport = definePlugin({
                     if (typeof want !== 'string' || !want) continue;
                     const hit = await findExisting(ctx, 'threat.file_hash', key, want);
                     if (hit) {
-                        ctx.progress?.log?.(`${hash}: already in this case as ${key} ${want} — enriching that node`);
+                        ctx.progress?.log?.(`${hash}: already in this project as ${key} ${want} — enriching that node`);
                         selfNodes.push(hit);
                         break;
                     }
@@ -1111,7 +1111,7 @@ export const vtPivotResolutions = definePlugin({
         identifier: 'run.vineyard.plugins.vt_pivot_resolutions',
         content_type: 'vineyard:plugin',
         name: 'VT Pivot Resolutions',
-        version: '1.2.0',
+        version: '1.2.1',
         description:
             "For each selected IP Address or Domain, fans out VirusTotal's resolutions (hostnames an IP served, IPs a domain resolved to), creates the missing nodes with the detection counts VirusTotal returns for each, and links both directions with 'resolves to' edges. Uses the analyst's own VirusTotal API key. Desktop only.",
         icon: 'git-fork',
@@ -1213,7 +1213,7 @@ export const vtPivotRelations = definePlugin({
         identifier: 'run.vineyard.plugins.vt_pivot_relations',
         content_type: 'vineyard:plugin',
         name: 'VT Subdomains',
-        version: '1.2.0',
+        version: '1.2.1',
         description:
             "For each selected Domain, fans out the subdomains VirusTotal knows about, links each one back with a 'subdomain of' edge, and folds in the full report VirusTotal returns per subdomain — detection counts and the engines that flagged it, registrar, registration and expiry dates, vendor categories — so a flagged subdomain is visible without a second lookup. Answers on a free community key. Uses the analyst's own VirusTotal API key. Desktop only.",
         icon: 'git-branch',
@@ -1297,7 +1297,7 @@ const pack: VineyardPluginPack & {
     identifier: 'run.vineyard.pluginpacks.virustotal_community',
     content_type: 'vineyard:pluginpack',
     name: 'VirusTotal Community',
-    version: '1.2.0',
+    version: '1.2.1',
     description:
         "VirusTotal v3 enrichment and pivots using the analyst's own API key, scoped to what a free community key can actually read (verified against one): IP/domain/URL reports, file-hash reports, passive-DNS resolutions and subdomain fan-out. Relationships that need a paid key are not included rather than attempted and skipped. Desktop only (VirusTotal answers no CORS headers).",
     author: { name: 'VINEYARD', url: 'https://vineyard.run' },
