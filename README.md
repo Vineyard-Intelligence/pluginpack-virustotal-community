@@ -15,8 +15,8 @@ and counted per item, never fatal.
 | `vt_domain_report` | **Verdict block** + vendor categories, registrar, registration/expiry → `infrastructure.domain`. Creates one `dns_record` per record VT last resolved (`has record`) and the serving `certificate` (`has certificate`); fills an existing `whois_record` (`has whois`). |
 | `vt_url_report` | **Verdict block** + categories, threat names, HTTP status, page title, final URL, `domain` → `web.url`. Links the serving `ip_address` (`resolves to`), the redirect chain (`redirects to`), the hosts the page reached (`has domain`) and the served content's SHA-256 (`has hash`). |
 | `vt_file_report` | Detection counts **and the malware names the engines gave**, reputation, file type/magic, tags, ssdeep + TLSH. A selected `threat.file_hash` is enriched **in place** (even if it only held an MD5); a `threat.malware` that named the hash gets `has hash`. The suggested threat label becomes a `malware` family node via `classified as`. |
-| `vt_pivot_resolutions` | IP↔domain resolution fan-out (`GET /…/resolutions`) → creates the missing side **with the detection counts the resolution carries for it** and links both ways via `resolves to`. |
-| `vt_pivot_relations` | Domain subdomains (`GET /domains/{d}/subdomains`) → creates each subdomain **with the full report VirusTotal returns for it** (verdict block, registrar, dates, categories) and links it back via `subdomain of`. (Shown as **VT Subdomains**.) |
+| `vt_passive_dns` | **VT Passive DNS** — IP↔domain resolution fan-out (`GET /…/resolutions`) → creates the missing side **with the detection counts the resolution carries for it** and links domain → IP via `resolves to`. |
+| `vt_subdomains` | **VT Subdomains** — domain subdomains (`GET /domains/{d}/subdomains`) → creates each subdomain **with the full report VirusTotal returns for it** (verdict block, registrar, dates, categories) and links it back via `subdomain of`. |
 
 ### The verdict block — what actually gets kept
 

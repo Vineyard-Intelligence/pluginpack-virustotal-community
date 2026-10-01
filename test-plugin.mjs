@@ -474,7 +474,7 @@ const vtErr = (code, message) => ({ error: { code, message } });
   check("file: a file the project has never seen is still created", r.counts.created === 1 && graph.createdNodes.some((n) => n.type === "threat.file_hash"));
 }
 
-// ================================================================ vt_pivot_resolutions
+// ================================================================ vt_passive_dns
 {
   // Measured shape: the resolution object's id is <ip><hostname> (unusable), the readable values
   // are attributes.host_name and attributes.ip_address.
@@ -707,7 +707,7 @@ const vtErr = (code, message) => ({ error: { code, message } });
   check("caps: a long detections list says how many it left out", /\(\+15 more\)$/.test(graph2.updates[0].data.vt_detections));
 }
 
-// ================================================================ vt_pivot_relations (subdomains)
+// ================================================================ vt_subdomains
 {
   const net = makeNet((url) => {
     check("subdomains: hits /domains/<d>/subdomains", url.pathname === "/api/v3/domains/google.com/subdomains");
