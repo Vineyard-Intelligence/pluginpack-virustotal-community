@@ -2,8 +2,8 @@
   "identifier": "run.vineyard.pluginpacks.virustotal_community",
   "content_type": "vineyard:pluginpack",
   "name": "VirusTotal Community",
-  "version": "1.2.1",
-  "description": "VirusTotal v3 enrichment and pivots using the analyst's own API key, scoped to what a free community key can actually read (verified against one): IP/domain/URL reports, file-hash reports, passive-DNS resolutions and subdomain fan-out. Relationships that need a paid key are not included rather than attempted and skipped. Desktop only (VirusTotal answers no CORS headers).",
+  "version": "1.3.0",
+  "description": "VirusTotal v3 reports (IP, domain, URL, file) and pivots (passive DNS, subdomains), limited to what a free community API key can read. Needs the analyst's own VirusTotal API key; a community key allows 240 requests/hour and 500/day. Desktop only.",
   "author": {
     "name": "VINEYARD",
     "url": "https://vineyard.run"
@@ -27,8 +27,8 @@
       "identifier": "run.vineyard.plugins.vt_ip_report",
       "content_type": "vineyard:plugin",
       "name": "VT IP Report",
-      "version": "1.2.1",
-      "description": "For each selected IP Address, folds VirusTotal's IP report into the node: how many engines call it malicious or suspicious and WHICH ones, the community reputation and votes, VT's tags, plus country, ASN and owner. Creates the Autonomous System (with its RIR) via 'announced by', the announced netblock via 'within netblock', and a WHOIS Record for that netblock. Uses the analyst's own VirusTotal API key (x-apikey). Desktop only (VT sends no CORS headers).",
+      "version": "1.3.0",
+      "description": "Looks up each selected IP Address on VirusTotal and writes the verdict onto it: malicious/suspicious/harmless/undetected counts, the flagging engines (vt_detections), reputation, votes and tags, plus country_code, asn and organization. Links an Autonomous System ('announced by'), Netblock ('within netblock') and that netblock's WHOIS Record ('has whois') only when they already exist in the project. Needs a VirusTotal API key. Desktop only.",
       "icon": "radar",
       "platforms": {
         "primary": "desktop",
@@ -107,8 +107,8 @@
       "identifier": "run.vineyard.plugins.vt_domain_report",
       "content_type": "vineyard:plugin",
       "name": "VT Domain Report",
-      "version": "1.2.1",
-      "description": "For each selected Domain, folds VirusTotal's domain report into the node: how many engines call it malicious or suspicious and WHICH ones, community reputation and votes, the vendor content categories, plus registrar and registration/expiry dates. Creates a WHOIS Record ('has whois'), a DNS Record node per record VT last saw ('has record'), and the last HTTPS certificate ('has certificate'). Uses the analyst's own VirusTotal API key. Desktop only.",
+      "version": "1.3.0",
+      "description": "Looks up each selected Domain on VirusTotal and writes the verdict onto it (detection counts, flagging engines, reputation, votes, tags, vt_categories) plus registrar, created_date and expiration_date. Creates up to 25 DNS Records VirusTotal last saw ('has record') and the last HTTPS Certificate ('has certificate'), and fills and links a WHOIS Record only if one already exists ('has whois'). Needs a VirusTotal API key. Desktop only.",
       "icon": "globe",
       "platforms": {
         "primary": "desktop",
@@ -187,8 +187,8 @@
       "identifier": "run.vineyard.plugins.vt_url_report",
       "content_type": "vineyard:plugin",
       "name": "VT URL Report",
-      "version": "1.2.1",
-      "description": "For each selected URL, folds VirusTotal's URL report into the node: how many engines call it malicious or suspicious and WHICH ones, community reputation and votes, vendor categories and threat names, plus HTTP status, page title and final URL. Links the last serving IP ('resolves to'), the redirect chain ('redirects to'), the hosts the page reached out to ('has domain') and the served content's SHA-256 ('has hash'). Uses the analyst's own VirusTotal API key. Desktop only.",
+      "version": "1.3.0",
+      "description": "Looks up each selected URL on VirusTotal and writes the verdict onto it (detection counts, flagging engines, reputation, votes, tags, vt_categories, vt_threat_names) plus http_status, page_title, final_url and domain. Links the last serving IP Address ('resolves to'), up to 25 redirect-chain URLs ('redirects to'), up to 25 outgoing-link hosts as Domains ('has domain') and the served content's SHA-256 as a File Hash ('has hash'). Needs a VirusTotal API key. Desktop only.",
       "icon": "link",
       "platforms": {
         "primary": "desktop",
@@ -272,8 +272,8 @@
       "identifier": "run.vineyard.plugins.vt_file_report",
       "content_type": "vineyard:plugin",
       "name": "VT File Report",
-      "version": "1.2.1",
-      "description": "Looks up SHA-256 / SHA-1 / MD5 hashes on VirusTotal's file report: detection counts and WHICH engines detected it, the malware names they gave, file type, tags, fuzzy hashes (ssdeep/TLSH) and submission stats. A selected File Hash node is enriched in place (even when it only carried an MD5); anything else that named the hash, such as a Malware node, gets a 'has hash' edge. The suggested threat label becomes a Malware node via 'classified as'. Hashes can also be pasted into the Run dialog. Uses the analyst's own VirusTotal API key. Desktop only.",
+      "version": "1.3.0",
+      "description": "Looks up SHA-256/SHA-1/MD5 hashes on VirusTotal, taken from the selected File Hash or Malware nodes and the Run dialog's hashes field. Writes all three hashes, size, file type, tags, detection counts, the flagging engines with their malware names, reputation, ssdeep/TLSH and submission stats onto the selected File Hash (else a matching existing one, else a new one), which the other selected nodes link to ('has hash'). Adds the suggested threat label as a Malware family node ('classified as'). Needs a VirusTotal API key. Desktop only.",
       "icon": "file-digit",
       "platforms": {
         "primary": "desktop",
@@ -359,11 +359,11 @@
       }
     },
     {
-      "identifier": "run.vineyard.plugins.vt_pivot_resolutions",
+      "identifier": "run.vineyard.plugins.vt_passive_dns",
       "content_type": "vineyard:plugin",
-      "name": "VT Pivot Resolutions",
-      "version": "1.2.1",
-      "description": "For each selected IP Address or Domain, fans out VirusTotal's resolutions (hostnames an IP served, IPs a domain resolved to), creates the missing nodes with the detection counts VirusTotal returns for each, and links both directions with 'resolves to' edges. Uses the analyst's own VirusTotal API key. Desktop only.",
+      "name": "VT Passive DNS",
+      "version": "1.3.0",
+      "description": "Adds VirusTotal's passive DNS resolutions, up to 120 per selected node: the hostnames seen on a selected IP Address as Domain nodes, and the IP Addresses a selected Domain resolved to, each with VirusTotal's detection counts and linked Domain 'resolves to' IP Address. Needs a VirusTotal API key. Desktop only.",
       "icon": "git-fork",
       "platforms": {
         "primary": "desktop",
@@ -439,11 +439,11 @@
       }
     },
     {
-      "identifier": "run.vineyard.plugins.vt_pivot_relations",
+      "identifier": "run.vineyard.plugins.vt_subdomains",
       "content_type": "vineyard:plugin",
       "name": "VT Subdomains",
-      "version": "1.2.1",
-      "description": "For each selected Domain, fans out the subdomains VirusTotal knows about, links each one back with a 'subdomain of' edge, and folds in the full report VirusTotal returns per subdomain — detection counts and the engines that flagged it, registrar, registration and expiry dates, vendor categories — so a flagged subdomain is visible without a second lookup. Answers on a free community key. Uses the analyst's own VirusTotal API key. Desktop only.",
+      "version": "1.3.0",
+      "description": "Adds the subdomains VirusTotal knows for each selected Domain, up to 120 per domain, as Domains linked 'subdomain of', each filled from VirusTotal's report on it: detection counts, flagging engines, reputation, votes, tags, registrar, created/expiration dates and vt_categories. Needs a VirusTotal API key. Desktop only.",
       "icon": "git-branch",
       "platforms": {
         "primary": "desktop",
