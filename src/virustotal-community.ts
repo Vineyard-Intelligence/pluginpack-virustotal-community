@@ -74,13 +74,7 @@ const PLATFORMS: PluginManifest['platforms'] = {
     web: { runtime: 'sandbox-js', entry: 'dist/pack.mjs' },
     desktop: { runtime: 'sandbox-js', entry: 'dist/pack.mjs', min_app_version: '0.1.0' },
 };
-const NET_SCOPE: NetworkScope[] = [
-    {
-        endpoint: VT_BASE,
-        methods: ['GET'],
-        purpose: "VirusTotal v3 reports and relationships (free tier) — the analyst's own key via the x-apikey header.",
-    },
-];
+const netScope = (purpose: string): NetworkScope[] => [{ endpoint: VT_BASE, methods: ['GET'], purpose }];
 const API_KEY_CONFIG: ConfigValue = {
     key: 'api_key',
     label: API_KEY_LABEL,
@@ -475,7 +469,7 @@ export const vtIpReport = definePlugin({
         identifier: 'run.vineyard.plugins.vt_ip_report',
         content_type: 'vineyard:plugin',
         name: 'VT IP Report',
-        version: '1.3.0',
+        version: '1.3.1',
         description:
             "Looks up each selected IP Address on VirusTotal and writes the verdict onto it: malicious/suspicious/harmless/undetected counts, the flagging engines (vt_detections), reputation, votes and tags, plus country_code, asn and organization. Links an Autonomous System ('announced by'), Netblock ('within netblock') and that netblock's WHOIS Record ('has whois') only when they already exist in the project. Needs a VirusTotal API key. Desktop only.",
         icon: 'radar',
@@ -490,7 +484,7 @@ export const vtIpReport = definePlugin({
         },
         scopes: {
             graph: GRAPH_SCOPES,
-            network: NET_SCOPE,
+            network: netScope('Look up IP address reports on VirusTotal.'),
             config: [API_KEY_CONFIG],
         },
         lifecycle: LIFECYCLE,
@@ -591,7 +585,7 @@ export const vtDomainReport = definePlugin({
         identifier: 'run.vineyard.plugins.vt_domain_report',
         content_type: 'vineyard:plugin',
         name: 'VT Domain Report',
-        version: '1.3.0',
+        version: '1.3.1',
         description:
             "Looks up each selected Domain on VirusTotal and writes the verdict onto it (detection counts, flagging engines, reputation, votes, tags, vt_categories) plus registrar, created_date and expiration_date. Creates up to 25 DNS Records VirusTotal last saw ('has record') and the last HTTPS Certificate ('has certificate'), and fills and links a WHOIS Record only if one already exists ('has whois'). Needs a VirusTotal API key. Desktop only.",
         icon: 'globe',
@@ -606,7 +600,7 @@ export const vtDomainReport = definePlugin({
         },
         scopes: {
             graph: GRAPH_SCOPES,
-            network: NET_SCOPE,
+            network: netScope('Look up domain reports on VirusTotal.'),
             config: [API_KEY_CONFIG],
         },
         lifecycle: LIFECYCLE,
@@ -724,7 +718,7 @@ export const vtUrlReport = definePlugin({
         identifier: 'run.vineyard.plugins.vt_url_report',
         content_type: 'vineyard:plugin',
         name: 'VT URL Report',
-        version: '1.3.0',
+        version: '1.3.1',
         description:
             "Looks up each selected URL on VirusTotal and writes the verdict onto it (detection counts, flagging engines, reputation, votes, tags, vt_categories, vt_threat_names) plus http_status, page_title, final_url and domain. Links the last serving IP Address ('resolves to'), up to 25 redirect-chain URLs ('redirects to'), up to 25 outgoing-link hosts as Domains ('has domain') and the served content's SHA-256 as a File Hash ('has hash'). Needs a VirusTotal API key. Desktop only.",
         icon: 'link',
@@ -740,7 +734,7 @@ export const vtUrlReport = definePlugin({
         },
         scopes: {
             graph: GRAPH_SCOPES,
-            network: NET_SCOPE,
+            network: netScope('Look up URL reports and their last serving IP address on VirusTotal.'),
             config: [API_KEY_CONFIG],
         },
         lifecycle: LIFECYCLE,
@@ -882,7 +876,7 @@ export const vtFileReport = definePlugin({
         identifier: 'run.vineyard.plugins.vt_file_report',
         content_type: 'vineyard:plugin',
         name: 'VT File Report',
-        version: '1.3.0',
+        version: '1.3.1',
         description:
             "Looks up SHA-256/SHA-1/MD5 hashes on VirusTotal, taken from the selected File Hash or Malware nodes and the Run dialog's hashes field. Writes all three hashes, size, file type, tags, detection counts, the flagging engines with their malware names, reputation, ssdeep/TLSH and submission stats onto the selected File Hash (else a matching existing one, else a new one), which the other selected nodes link to ('has hash'). Adds the suggested threat label as a Malware family node ('classified as'). Needs a VirusTotal API key. Desktop only.",
         icon: 'file-digit',
@@ -894,7 +888,7 @@ export const vtFileReport = definePlugin({
                     type: 'string',
                     title: 'Hashes',
                     description:
-                        'Optional. SHA-256 / SHA-1 / MD5 hashes — one per line or comma-separated. Used in addition to any selected nodes that carry a hash.',
+                        'SHA-256, SHA-1 or MD5 hashes separated by commas, spaces or new lines. Looked up in addition to hashes on the selected nodes; leave empty to use only those.',
                 },
             },
         },
@@ -914,7 +908,7 @@ export const vtFileReport = definePlugin({
         },
         scopes: {
             graph: GRAPH_SCOPES,
-            network: NET_SCOPE,
+            network: netScope('Look up file reports by hash on VirusTotal.'),
             config: [API_KEY_CONFIG],
         },
         lifecycle: LIFECYCLE,
@@ -1111,7 +1105,7 @@ export const vtPassiveDns = definePlugin({
         identifier: 'run.vineyard.plugins.vt_passive_dns',
         content_type: 'vineyard:plugin',
         name: 'VT Passive DNS',
-        version: '1.3.0',
+        version: '1.3.1',
         description:
             "Adds VirusTotal's passive DNS resolutions, up to 120 per selected node: the hostnames seen on a selected IP Address as Domain nodes, and the IP Addresses a selected Domain resolved to, each with VirusTotal's detection counts and linked Domain 'resolves to' IP Address. Needs a VirusTotal API key. Desktop only.",
         icon: 'git-fork',
@@ -1128,7 +1122,7 @@ export const vtPassiveDns = definePlugin({
         },
         scopes: {
             graph: GRAPH_SCOPES,
-            network: NET_SCOPE,
+            network: netScope('Read passive DNS resolutions of IP addresses and domains on VirusTotal.'),
             config: [API_KEY_CONFIG],
         },
         lifecycle: LIFECYCLE,
@@ -1213,7 +1207,7 @@ export const vtSubdomains = definePlugin({
         identifier: 'run.vineyard.plugins.vt_subdomains',
         content_type: 'vineyard:plugin',
         name: 'VT Subdomains',
-        version: '1.3.0',
+        version: '1.3.1',
         description:
             "Adds the subdomains VirusTotal knows for each selected Domain, up to 120 per domain, as Domains linked 'subdomain of', each filled from VirusTotal's report on it: detection counts, flagging engines, reputation, votes, tags, registrar, created/expiration dates and vt_categories. Needs a VirusTotal API key. Desktop only.",
         icon: 'git-branch',
@@ -1228,7 +1222,7 @@ export const vtSubdomains = definePlugin({
         },
         scopes: {
             graph: GRAPH_SCOPES,
-            network: NET_SCOPE,
+            network: netScope('List the subdomains of domains on VirusTotal.'),
             config: [API_KEY_CONFIG],
         },
         lifecycle: LIFECYCLE,
@@ -1297,7 +1291,7 @@ const pack: VineyardPluginPack & {
     identifier: 'run.vineyard.pluginpacks.virustotal_community',
     content_type: 'vineyard:pluginpack',
     name: 'VirusTotal Community',
-    version: '1.3.0',
+    version: '1.3.1',
     description:
         "VirusTotal v3 reports (IP, domain, URL, file) and pivots (passive DNS, subdomains), limited to what a free community API key can read. Needs the analyst's own VirusTotal API key; a community key allows 240 requests/hour and 500/day. Desktop only.",
     author: { name: 'VINEYARD', url: 'https://vineyard.run' },
