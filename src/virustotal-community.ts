@@ -362,6 +362,85 @@ function certTime(v: unknown): string | undefined {
     return typeof v === 'string' && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(v) ? `${v.replace(' ', 'T')}Z` : undefined;
 }
 
+/** Suffixes no public certificate can name. Appliance default certificates carry them
+ *  (`unifi.local`), and as nodes they would join every such device into one hub. */
+const INTERNAL_SUFFIX = /\.(local|localdomain|localhost|internal|lan|home\.arpa)$/;
+
+/** The public DNS names a certificate's SAN lists, `*.` stripped (the wildcard's parent is the name
+ *  the holder controls), deduped. IP entries, single labels and internal names are dropped. */
+function sanDomains(raw: unknown): string[] {
+    const out = new Set<string>();
+    for (const v of Array.isArray(raw) ? raw : []) {
+        if (typeof v !== 'string') continue;
+        const name = v.trim().toLowerCase().replace(/\.$/, '').replace(/^\*\./, '');
+        if (DOMAIN_RE.test(name) && !INTERNAL_SUFFIX.test(name)) out.add(name);
+    }
+    return [...out];
+}
+
+/** Whether a SAN list covers `domain`: the name itself, or a wildcard one label up. */
+function certCovers(raw: unknown, domain: string): boolean {
+    const want = [domain, `*.${domain.slice(domain.indexOf('.') + 1)}`];
+    return (Array.isArray(raw) ? raw : []).some((v) => typeof v === 'string' && want.includes(v.trim().toLowerCase()));
+}
+
+/**
+ * A `last_https_certificate` as typepack properties plus its SAN names, or null without a usable
+ * thumbprint. Its identity is the SHA-256 thumbprint, so every IP and domain on a shared cert
+ * converges on one node — which is the pivot worth having. `san_count` is the number of names it
+ * lists, recorded even when they are too many to add (see addSanDomains).
+ */
+function vtCert(cert: any): { data: Record<string, unknown>; names: string[] } | null {
+    const thumb = cert?.thumbprint_sha256;
+    if (typeof thumb !== 'string' || !/^[a-f0-9]{64}$/i.test(thumb)) return null;
+    const data: Record<string, unknown> = { fingerprint_sha256: thumb };
+    if (typeof cert.subject?.CN === 'string') data.subject_common_name = cert.subject.CN;
+    const issuer = [cert.issuer?.O, cert.issuer?.CN].filter((x: unknown) => typeof x === 'string' && x);
+    if (issuer.length) data.issuer = issuer.join(' — ');
+    if (typeof cert.serial_number === 'string') data.serial_number = cert.serial_number;
+    const nb = certTime(cert.validity?.not_before);
+    const na = certTime(cert.validity?.not_after);
+    if (nb) data.not_before = nb;
+    if (na) data.not_after = na;
+    const names = sanDomains(cert.extensions?.subject_alternative_name);
+    if (names.length) data.san_count = names.length;
+    return { data, names };
+}
+
+/** More SAN names than this and none become nodes — same cap as the DNS records. */
+const MAX_SANS = MAX_LISTED;
+
+/**
+ * The certificate's SAN names as Domain nodes, linked certificate → domain by 'names domain'. Not
+ * 'has certificate': a name a certificate lists may never have served it.
+ *
+ * Past MAX_SANS names nothing fans out. A list that long is a CDN or shared-hosting certificate
+ * whose tenants have nothing to do with each other; the certificate node is already the point they
+ * share, and san_count on it says how many there are. Returns how many were linked.
+ *
+ * Once per certificate per run (`done`): when several selected IPs or domains share a certificate,
+ * its names are the certificate's, and linking them again for each would only repeat the edges.
+ */
+async function addSanDomains(
+    ctx: HostContext, certNode: GraphNode, names: string[], who: string, done: Set<string>, skip = '',
+): Promise<number> {
+    if (done.has(certNode.id)) return 0;
+    done.add(certNode.id);
+    if (names.length > MAX_SANS) {
+        ctx.progress?.log?.(`${who}: the certificate lists ${names.length} names — over ${MAX_SANS}, so none were added (san_count is on the certificate)`);
+        return 0;
+    }
+    let linked = 0;
+    for (const name of names) {
+        if (ctx.signal?.aborted) throw abortErr();
+        if (name === skip) continue;
+        const dNode = await ensureNode(ctx, 'infrastructure.domain', { domain_name: name });
+        await ensureEdge(ctx, certNode.id, dNode.id, 'names domain');
+        linked++;
+    }
+    return linked;
+}
+
 /**
  * A relationship page does not return bare ids — it returns whole OBJECTS.
  *
@@ -469,9 +548,9 @@ export const vtIpReport = definePlugin({
         identifier: 'run.vineyard.plugins.vt_ip_report',
         content_type: 'vineyard:plugin',
         name: 'VT IP Report',
-        version: '1.3.2',
+        version: '1.4.0',
         description:
-            "Looks up each selected IP Address on VirusTotal and writes the verdict onto it: malicious/suspicious/harmless/undetected counts, the flagging engines (vt_detections), reputation, votes and tags, plus country_code, asn and organization. Links an Autonomous System ('announced by'), Netblock ('within netblock') and that netblock's WHOIS Record ('has whois') only when they already exist in the project. Needs a VirusTotal API key. Desktop only.",
+            "Looks up each selected IP Address on VirusTotal and writes the verdict onto it: malicious/suspicious/harmless/undetected counts, the flagging engines (vt_detections), reputation, votes and tags, plus country_code, asn and organization. Creates the last HTTPS Certificate it presented ('presents certificate', with san_count) and, when the certificate lists 25 names or fewer, each as a Domain ('names domain'). Links an Autonomous System ('announced by'), Netblock ('within netblock') and that netblock's WHOIS Record ('has whois') only when they already exist in the project. Needs a VirusTotal API key. Desktop only.",
         icon: 'radar',
         platforms: PLATFORMS,
         io: {
@@ -480,6 +559,8 @@ export const vtIpReport = definePlugin({
                 { typepack: 'run.vineyard.typepacks.infrastructure', category: 'infrastructure', name: 'autonomous_system' },
                 { typepack: 'run.vineyard.typepacks.infrastructure', category: 'infrastructure', name: 'netblock' },
                 { typepack: 'run.vineyard.typepacks.infrastructure', category: 'infrastructure', name: 'whois_record' },
+                { typepack: 'run.vineyard.typepacks.infrastructure', category: 'infrastructure', name: 'certificate' },
+                { typepack: 'run.vineyard.typepacks.infrastructure', category: 'infrastructure', name: 'domain' },
             ],
         },
         scopes: {
@@ -491,10 +572,13 @@ export const vtIpReport = definePlugin({
     },
     async run(ctx): Promise<RunResult> {
         const nodes = await selectedNodesOfTypes(ctx, ['infrastructure.ip_address']);
-        if (!nodes.length) return { summary: 'Select one or more IP Address nodes first', counts: { checked: 0, enriched: 0, asns: 0, netblocks: 0, flagged: 0, misses: 0 } };
+        if (!nodes.length) return { summary: 'Select one or more IP Address nodes first', counts: { checked: 0, enriched: 0, asns: 0, netblocks: 0, certs: 0, sans: 0, flagged: 0, misses: 0 } };
         let enriched = 0;
         let asns = 0;
         let netblocks = 0;
+        let certs = 0;
+        let sans = 0;
+        const namedCerts = new Set<string>();
         let flagged = 0;
         let misses = 0;
         for (let i = 0; i < nodes.length; i++) {
@@ -570,10 +654,20 @@ export const vtIpReport = definePlugin({
                     }
                 }
             }
+            // The certificate VirusTotal last saw on this IP's HTTPS port, and the names it lists.
+            // Unlike a domain's, there is no name to check it against: what an IP presents is the
+            // fact, and a shared-hosting certificate is held off by the cap in addSanDomains.
+            const cert = vtCert(attrs.last_https_certificate);
+            if (cert) {
+                const certNode = await ensureNode(ctx, 'infrastructure.certificate', cert.data);
+                await ensureEdge(ctx, n.id, certNode.id, 'presents certificate');
+                certs++;
+                sans += await addSanDomains(ctx, certNode, cert.names, ip, namedCerts);
+            }
         }
-        const summary = `${enriched} of ${nodes.length} IP(s) enriched${flagged ? `, ${flagged} FLAGGED by VirusTotal` : ''}${asns ? `, ${asns} ASN link(s)` : ''}${netblocks ? `, ${netblocks} netblock(s)` : ''}${misses ? `, ${misses} skipped` : ''}`;
+        const summary = `${enriched} of ${nodes.length} IP(s) enriched${flagged ? `, ${flagged} FLAGGED by VirusTotal` : ''}${asns ? `, ${asns} ASN link(s)` : ''}${netblocks ? `, ${netblocks} netblock(s)` : ''}${certs ? `, ${certs} certificate(s)` : ''}${sans ? `, ${sans} certificate name(s)` : ''}${misses ? `, ${misses} skipped` : ''}`;
         ctx.progress?.set?.({ percent: 100, message: summary });
-        return { summary, counts: { checked: nodes.length, enriched, asns, netblocks, flagged, misses } };
+        return { summary, counts: { checked: nodes.length, enriched, asns, netblocks, certs, sans, flagged, misses } };
     },
 });
 
@@ -585,9 +679,9 @@ export const vtDomainReport = definePlugin({
         identifier: 'run.vineyard.plugins.vt_domain_report',
         content_type: 'vineyard:plugin',
         name: 'VT Domain Report',
-        version: '1.3.2',
+        version: '1.4.0',
         description:
-            "Looks up each selected Domain on VirusTotal and writes the verdict onto it (detection counts, flagging engines, reputation, votes, tags, vt_categories) plus registrar, created_date and expiration_date. Creates up to 25 DNS Records VirusTotal last saw ('has record') and the last HTTPS Certificate ('has certificate'), and fills and links a WHOIS Record only if one already exists ('has whois'). Needs a VirusTotal API key. Desktop only.",
+            "Looks up each selected Domain on VirusTotal and writes the verdict onto it (detection counts, flagging engines, reputation, votes, tags, vt_categories) plus registrar, created_date and expiration_date. Creates up to 25 DNS Records VirusTotal last saw ('has record') and the last HTTPS Certificate ('has certificate', with san_count); when that certificate covers the domain and lists 25 names or fewer, each other name becomes a Domain ('names domain'). Fills and links a WHOIS Record only if one already exists ('has whois'). Needs a VirusTotal API key. Desktop only.",
         icon: 'globe',
         platforms: PLATFORMS,
         io: {
@@ -596,6 +690,7 @@ export const vtDomainReport = definePlugin({
                 { typepack: 'run.vineyard.typepacks.infrastructure', category: 'infrastructure', name: 'whois_record' },
                 { typepack: 'run.vineyard.typepacks.infrastructure', category: 'infrastructure', name: 'dns_record' },
                 { typepack: 'run.vineyard.typepacks.infrastructure', category: 'infrastructure', name: 'certificate' },
+                { typepack: 'run.vineyard.typepacks.infrastructure', category: 'infrastructure', name: 'domain' },
             ],
         },
         scopes: {
@@ -607,11 +702,13 @@ export const vtDomainReport = definePlugin({
     },
     async run(ctx): Promise<RunResult> {
         const nodes = await selectedNodesOfTypes(ctx, ['infrastructure.domain']);
-        if (!nodes.length) return { summary: 'Select one or more Domain nodes first', counts: { checked: 0, enriched: 0, whois: 0, dns: 0, certs: 0, flagged: 0, misses: 0 } };
+        if (!nodes.length) return { summary: 'Select one or more Domain nodes first', counts: { checked: 0, enriched: 0, whois: 0, dns: 0, certs: 0, sans: 0, flagged: 0, misses: 0 } };
         let enriched = 0;
         let whois = 0;
         let dns = 0;
         let certs = 0;
+        let sans = 0;
+        const namedCerts = new Set<string>();
         let flagged = 0;
         let misses = 0;
         for (let i = 0; i < nodes.length; i++) {
@@ -685,28 +782,24 @@ export const vtDomainReport = definePlugin({
                 dns++;
             }
 
-            // The serving certificate. Its identity is the SHA-256 thumbprint, so every domain on a
-            // shared cert converges on one node — which is the pivot worth having.
-            const cert = attrs.last_https_certificate;
-            const thumb = cert?.thumbprint_sha256;
-            if (typeof thumb === 'string' && /^[a-f0-9]{64}$/i.test(thumb)) {
-                const certData: Record<string, unknown> = { fingerprint_sha256: thumb };
-                if (typeof cert.subject?.CN === 'string') certData.subject_common_name = cert.subject.CN;
-                const issuer = [cert.issuer?.O, cert.issuer?.CN].filter((x: unknown) => typeof x === 'string' && x);
-                if (issuer.length) certData.issuer = issuer.join(' — ');
-                if (typeof cert.serial_number === 'string') certData.serial_number = cert.serial_number;
-                const nb = certTime(cert.validity?.not_before);
-                const na = certTime(cert.validity?.not_after);
-                if (nb) certData.not_before = nb;
-                if (na) certData.not_after = na;
-                const certNode = await ensureNode(ctx, 'infrastructure.certificate', certData);
+            // The serving certificate, and the other names it lists.
+            const cert = vtCert(attrs.last_https_certificate);
+            if (cert) {
+                const certNode = await ensureNode(ctx, 'infrastructure.certificate', cert.data);
                 await ensureEdge(ctx, n.id, certNode.id, 'has certificate');
                 certs++;
+                // Only a certificate that covers this domain speaks for it. One that does not is a
+                // hoster's default or a mismatch, and its names are the hoster's, not this domain's.
+                if (certCovers(attrs.last_https_certificate.extensions?.subject_alternative_name, d.toLowerCase())) {
+                    sans += await addSanDomains(ctx, certNode, cert.names, d, namedCerts, d.toLowerCase());
+                } else if (cert.names.length) {
+                    ctx.progress?.log?.(`${d}: the certificate does not cover this domain — its names were not added`);
+                }
             }
         }
-        const summary = `${enriched} of ${nodes.length} domain(s) enriched${flagged ? `, ${flagged} FLAGGED by VirusTotal` : ''}${whois ? `, ${whois} WHOIS` : ''}${dns ? `, ${dns} DNS record(s)` : ''}${certs ? `, ${certs} certificate(s)` : ''}${misses ? `, ${misses} skipped` : ''}`;
+        const summary = `${enriched} of ${nodes.length} domain(s) enriched${flagged ? `, ${flagged} FLAGGED by VirusTotal` : ''}${whois ? `, ${whois} WHOIS` : ''}${dns ? `, ${dns} DNS record(s)` : ''}${certs ? `, ${certs} certificate(s)` : ''}${sans ? `, ${sans} certificate name(s)` : ''}${misses ? `, ${misses} skipped` : ''}`;
         ctx.progress?.set?.({ percent: 100, message: summary });
-        return { summary, counts: { checked: nodes.length, enriched, whois, dns, certs, flagged, misses } };
+        return { summary, counts: { checked: nodes.length, enriched, whois, dns, certs, sans, flagged, misses } };
     },
 });
 
@@ -718,7 +811,7 @@ export const vtUrlReport = definePlugin({
         identifier: 'run.vineyard.plugins.vt_url_report',
         content_type: 'vineyard:plugin',
         name: 'VT URL Report',
-        version: '1.3.2',
+        version: '1.4.0',
         description:
             "Looks up each selected URL on VirusTotal and writes the verdict onto it (detection counts, flagging engines, reputation, votes, tags, vt_categories, vt_threat_names) plus http_status, page_title, final_url and domain. Links the last serving IP Address ('resolves to'), up to 25 redirect-chain URLs ('redirects to'), up to 25 outgoing-link hosts as Domains ('has domain') and the served content's SHA-256 as a File Hash ('has hash'). Needs a VirusTotal API key. Desktop only.",
         icon: 'link',
@@ -876,7 +969,7 @@ export const vtFileReport = definePlugin({
         identifier: 'run.vineyard.plugins.vt_file_report',
         content_type: 'vineyard:plugin',
         name: 'VT File Report',
-        version: '1.3.2',
+        version: '1.4.0',
         description:
             "Looks up SHA-256/SHA-1/MD5 hashes on VirusTotal, taken from the selected File Hash or Malware nodes and the Run dialog's hashes field. Writes all three hashes, size, file type, tags, detection counts, the flagging engines with their malware names, reputation, ssdeep/TLSH and submission stats onto the selected File Hash (else a matching existing one, else a new one), which the other selected nodes link to ('has hash'). Adds the suggested threat label as a Malware family node ('classified as'). Needs a VirusTotal API key. Desktop only.",
         icon: 'file-digit',
@@ -1105,7 +1198,7 @@ export const vtPassiveDns = definePlugin({
         identifier: 'run.vineyard.plugins.vt_passive_dns',
         content_type: 'vineyard:plugin',
         name: 'VT Passive DNS',
-        version: '1.3.2',
+        version: '1.4.0',
         description:
             "Adds VirusTotal's passive DNS resolutions, up to 120 per selected node: the hostnames seen on a selected IP Address as Domain nodes, and the IP Addresses a selected Domain resolved to, each with VirusTotal's detection counts and linked Domain 'resolves to' IP Address. Needs a VirusTotal API key. Desktop only.",
         icon: 'git-fork',
@@ -1207,7 +1300,7 @@ export const vtSubdomains = definePlugin({
         identifier: 'run.vineyard.plugins.vt_subdomains',
         content_type: 'vineyard:plugin',
         name: 'VT Subdomains',
-        version: '1.3.2',
+        version: '1.4.0',
         description:
             "Adds the subdomains VirusTotal knows for each selected Domain, up to 120 per domain, as Domains linked 'subdomain of', each filled from VirusTotal's report on it: detection counts, flagging engines, reputation, votes, tags, registrar, created/expiration dates and vt_categories. Needs a VirusTotal API key. Desktop only.",
         icon: 'git-branch',
@@ -1291,7 +1384,7 @@ const pack: VineyardPluginPack & {
     identifier: 'run.vineyard.pluginpacks.virustotal_community',
     content_type: 'vineyard:pluginpack',
     name: 'VirusTotal Community',
-    version: '1.3.2',
+    version: '1.4.0',
     description:
         "VirusTotal v3 reports (IP, domain, URL, file) and pivots (passive DNS, subdomains), limited to what a free community API key can read. Needs the analyst's own VirusTotal API key; a community key allows 240 requests/hour and 500/day. Desktop only.",
     author: { name: 'VINEYARD', url: 'https://vineyard.run' },

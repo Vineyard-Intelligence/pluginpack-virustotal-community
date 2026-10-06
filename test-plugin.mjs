@@ -636,6 +636,105 @@ const vtErr = (code, message) => ({ error: { code, message } });
   check("cert: validity converted to ISO datetimes", cert.data.not_before === "2026-07-20T18:05:56Z" && cert.data.not_after === "2026-10-12T18:05:55Z");
   check("cert: linked with 'has certificate'", graph.createdEdges.some((e) => e.label === "has certificate"));
 }
+
+// ================================================================ certificate SAN names
+// Shape per the VT SSL Certificate object (docs.virustotal.com/reference/ssl-certificate):
+// `extensions.subject_alternative_name` is an array of strings, which can hold IP entries too.
+const googleCert = (sans) => ({
+  thumbprint_sha256: "f17b9c4b5f765953518b609536736ff0da9d4363a0644ccd48fd44dc79fcf2da",
+  thumbprint: "b8d3e8ba2b4d6f3c0b8b1d7c0a2e3f4a5b6c7d8e",
+  serial_number: "dd5ed3b07e3e084412b41c8e619d95a4",
+  version: "V3",
+  signature_algorithm: "sha256RSA",
+  subject: { CN: "*.google.com" },
+  issuer: { C: "US", O: "Google Trust Services", CN: "WR2" },
+  validity: { not_after: "2026-10-12 18:05:55", not_before: "2026-07-20 18:05:56" },
+  extensions: { subject_alternative_name: sans, key_usage: ["digitalSignature"], CA: false },
+});
+const sansOf = (graph) => {
+  const domains = new Map(graph.createdNodes.filter((n) => n.type === "infrastructure.domain").map((n) => [n.id, n.data.domain_name]));
+  return graph.createdEdges.filter((e) => e.label === "names domain").map((e) => domains.get(e.to)).sort();
+};
+{
+  const sans = ["*.google.com", "google.com", "*.appengine.google.com", "youtube.com", "*.youtube.com", "Google.com.", "142.250.196.110", "localhost", "gw.local"];
+  const net = makeNet(() => ({ status: 200, body: { data: { attributes: { last_https_certificate: googleCert(sans) } } } }));
+  const graph = makeGraph({ d1: { id: "d1", type: "infrastructure.domain", data: { domain_name: "google.com" } } });
+  const r = await domainPlugin.run({ ...RUN, config: KEY, input: { selection: ["d1"] }, net, graph });
+  const cert = graph.createdNodes.find((n) => n.type === "infrastructure.certificate");
+  check("san: each other name the certificate lists becomes a Domain, '*.' stripped and deduped", sansOf(graph).join() === "appengine.google.com,youtube.com");
+  check("san: linked certificate -> domain, not 'has certificate'", graph.createdEdges.filter((e) => e.label === "names domain").every((e) => e.from === cert.id));
+  check("san: the looked-up domain is not linked back to its own certificate", !sansOf(graph).includes("google.com"));
+  check("san: IP entries, single labels and internal names are dropped", !graph.createdNodes.some((n) => /^(142\.|localhost|gw\.local)/.test(n.data.domain_name || "")));
+  check("san: san_count counts the distinct public names", cert.data.san_count === 3);
+  check("san: counted in the summary", r.counts.sans === 2 && /2 certificate name\(s\)/.test(r.summary));
+}
+{
+  // A wildcard one label up covers the domain.
+  const net = makeNet(() => ({ status: 200, body: { data: { attributes: { last_https_certificate: googleCert(["*.example.com", "example.net"]) } } } }));
+  const graph = makeGraph({ d1: { id: "d1", type: "infrastructure.domain", data: { domain_name: "shop.example.com" } } });
+  await domainPlugin.run({ ...RUN, config: KEY, input: { selection: ["d1"] }, net, graph });
+  check("san: a covering wildcard lets the names through", sansOf(graph).join() === "example.com,example.net");
+}
+{
+  // A certificate that does not name the domain is a hoster's default or a mismatch: its names are
+  // the hoster's, not the domain's.
+  const logs = [];
+  const net = makeNet(() => ({ status: 200, body: { data: { attributes: { last_https_certificate: googleCert(["*.hostingco.net", "hostingco.net"]) } } } }));
+  const graph = makeGraph({ d1: { id: "d1", type: "infrastructure.domain", data: { domain_name: "victim.test" } } });
+  await domainPlugin.run({ ...RUN, progress: { set() {}, log: (m) => logs.push(m) }, config: KEY, input: { selection: ["d1"] }, net, graph });
+  check("san: a certificate that does not cover the domain adds no names", sansOf(graph).length === 0);
+  check("san: ...but is still the domain's certificate, and says why", graph.createdEdges.some((e) => e.label === "has certificate") && logs.some((l) => /does not cover/.test(l)));
+}
+{
+  // IP report: the certificate the IP presented, and its names.
+  const net = makeNet(() => ({ status: 200, body: { data: { attributes: { last_https_certificate: googleCert(["*.example.org", "example.org", "mail.example.org"]) } } } }));
+  const graph = makeGraph({ ip1: { id: "ip1", type: "infrastructure.ip_address", data: { ip_address: "192.0.2.10" } } });
+  const r = await ipPlugin.run({ ...RUN, config: KEY, input: { selection: ["ip1"] }, net, graph });
+  const cert = graph.createdNodes.find((n) => n.type === "infrastructure.certificate");
+  check("ip cert: the IP's certificate is created with the domain report's fields", cert && cert.data.fingerprint_sha256 === googleCert([]).thumbprint_sha256 && cert.data.issuer === "Google Trust Services — WR2" && cert.data.not_after === "2026-10-12T18:05:55Z");
+  check("ip cert: linked IP -> certificate by 'presents certificate'", graph.createdEdges.some((e) => e.from === "ip1" && e.to === cert?.id && e.label === "presents certificate"));
+  check("ip cert: its SAN names become Domains", sansOf(graph).join() === "example.org,mail.example.org");
+  check("ip cert: counted", r.counts.certs === 1 && r.counts.sans === 2);
+}
+{
+  // A CDN / shared-hosting certificate: dozens of unrelated tenants. No fan-out, the count on the node.
+  const tenants = Array.from({ length: 40 }, (_, i) => `tenant${i}-shop.com`);
+  const logs = [];
+  const net = makeNet(() => ({ status: 200, body: { data: { attributes: { last_https_certificate: googleCert(["sni.cloudflaressl.com", ...tenants.flatMap((t) => [t, `*.${t}`])]) } } } }));
+  const graph = makeGraph({ ip1: { id: "ip1", type: "infrastructure.ip_address", data: { ip_address: "104.16.0.1" } } });
+  await ipPlugin.run({ ...RUN, progress: { set() {}, log: (m) => logs.push(m) }, config: KEY, input: { selection: ["ip1"] }, net, graph });
+  const cert = graph.createdNodes.find((n) => n.type === "infrastructure.certificate");
+  check("san cap: over 25 names, none become nodes", !graph.createdNodes.some((n) => n.type === "infrastructure.domain") && sansOf(graph).length === 0);
+  check("san cap: the certificate records how many it lists", cert && cert.data.san_count === 41);
+  check("san cap: the log says why", logs.some((l) => /41 names — over 25/.test(l)));
+}
+{
+  // Exactly at the cap still fans out.
+  const names = Array.from({ length: 25 }, (_, i) => `n${i}.example.com`);
+  const net = makeNet(() => ({ status: 200, body: { data: { attributes: { last_https_certificate: googleCert(names) } } } }));
+  const graph = makeGraph({ ip1: { id: "ip1", type: "infrastructure.ip_address", data: { ip_address: "192.0.2.11" } } });
+  await ipPlugin.run({ ...RUN, config: KEY, input: { selection: ["ip1"] }, net, graph });
+  check("san cap: 25 names is not over the cap", sansOf(graph).length === 25);
+}
+{
+  // Two selected IPs behind one certificate. The host merges createNode calls by identity (imitated
+  // here), so both IPs get the same certificate node — whose names are linked once, not per IP.
+  const net = makeNet(() => ({ status: 200, body: { data: { attributes: { last_https_certificate: googleCert(["example.org", "mail.example.org"]) } } } }));
+  const graph = makeGraph({
+    ip1: { id: "ip1", type: "infrastructure.ip_address", data: { ip_address: "192.0.2.21" } },
+    ip2: { id: "ip2", type: "infrastructure.ip_address", data: { ip_address: "192.0.2.22" } },
+  });
+  const create = graph.createNode;
+  const byIdentity = new Map();
+  graph.createNode = async (d) => {
+    const k = `${d.type}\0${d.data.fingerprint_sha256 ?? d.data.domain_name}`;
+    if (!byIdentity.has(k)) byIdentity.set(k, await create(d));
+    return byIdentity.get(k);
+  };
+  const r = await ipPlugin.run({ ...RUN, config: KEY, input: { selection: ["ip1", "ip2"] }, net, graph });
+  check("san: a certificate shared by two selected IPs links its names once", sansOf(graph).join() === "example.org,mail.example.org" && r.counts.sans === 2);
+  check("san: ...while each IP still presents it", graph.createdEdges.filter((e) => e.label === "presents certificate").length === 2);
+}
 {
   // The redirect chain and contacted hosts are PLAIN ATTRIBUTES of the free URL report — the same
   // two facts the premium redirects_to / contacted_domains relationships carry, at no extra request.
