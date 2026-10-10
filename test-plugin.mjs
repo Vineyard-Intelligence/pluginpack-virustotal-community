@@ -157,7 +157,7 @@ const vtErr = (code, message) => ({ error: { code, message } });
     "ip: writes a DELTA — only fields this run filled",
     graph.updates.length === 1 &&
       graph.updates[0].data.country_code === "US" &&
-      graph.updates[0].data.asn === "AS15169" &&
+      graph.updates[0].data.asn === 15169 &&
       graph.updates[0].data.organization === "GOOGLE",
   );
   // The delta contract: a field the node already had, that this run did not learn, must not ride
@@ -168,7 +168,7 @@ const vtErr = (code, message) => ({ error: { code, message } });
   // get one minted for it — the ASN and owner are on the IP node either way.
   check("ip: no AS node is invented when the project has none", !graph.createdNodes.some((n) => n.type === "infrastructure.autonomous_system"));
   check("ip: ...and no edge to one either", graph.createdEdges.length === 0);
-  check("ip: the ASN and owner are still on the IP node", graph.updates[0].data.asn === "AS15169" && graph.updates[0].data.organization === "GOOGLE");
+  check("ip: the ASN and owner are still on the IP node", graph.updates[0].data.asn === 15169 && graph.updates[0].data.organization === "GOOGLE");
 }
 {
   // Measured: VT answers 400 InvalidArgumentError for a malformed address. Treating it as fatal
