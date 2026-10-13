@@ -2,8 +2,7 @@
 // serves. Everything is inlined (the SDK is types plus identity helpers), because the module is
 // fetched by URL in a Web Worker with no import map: any bare specifier left in it would fail.
 //
-// Same flags the frontend's scripts/build-packs.mjs uses, so the artifact is byte-compatible with
-// how the other packs are produced:
+// Same esbuild flags as the other pack repos' build scripts:
 //   esbuild --bundle --format=esm --target=es2022 --platform=browser --minify
 //
 // Usage: node build.mjs
