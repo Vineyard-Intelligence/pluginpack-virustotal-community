@@ -24,10 +24,10 @@
 // Every attribute these plugins read is present on a community key; what a paid key adds
 // (threat_severity, exiftool, identified_brands, …) is not read here.
 //
-// WHAT IS KEPT, AND WHY IT IS NOT "THE THREE FIELDS": this pack used to fold country, ASN and
-// owner off an IP report and drop everything else — which meant it dropped all 91 engine verdicts,
-// the detection counts, the reputation and the community votes. Those are the report. The whole
-// response is still far too big to store (one IP report is ~40 KB of engine rows and RDAP), so
+// WHAT IS KEPT, AND WHY IT IS NOT "THE THREE FIELDS": folding country, ASN and owner off an IP
+// report and dropping everything else would drop all 91 engine verdicts, the detection counts, the
+// reputation and the community votes. Those are the report. The whole response is far too big to
+// store (one IP report is ~40 KB of engine rows and RDAP), so
 // `verdictFields` selects: the four counts, the engines that FLAGGED it by name and verdict, the
 // reputation, the votes, VT's tags, the analysis date. Everything else is either context that maps
 // onto a declared property (country, ASN, network, RIR, registrar, dates) or is left behind.
@@ -72,7 +72,7 @@ const API_KEY_LABEL = 'VirusTotal API Key';
 const PLATFORMS: PluginManifest['platforms'] = {
     primary: 'desktop',
     web: { runtime: 'sandbox-js', entry: 'dist/pack.mjs' },
-    desktop: { runtime: 'sandbox-js', entry: 'dist/pack.mjs', min_app_version: '0.1.0' },
+    desktop: { runtime: 'sandbox-js', entry: 'dist/pack.mjs' },
 };
 const netScope = (purpose: string): NetworkScope[] => [{ endpoint: VT_BASE, methods: ['GET'], purpose }];
 const API_KEY_CONFIG: ConfigValue = {
@@ -282,9 +282,9 @@ function joinCapped(parts: string[], max = MAX_LISTED): string | undefined {
 /**
  * THE REASON TO CALL VIRUSTOTAL, folded onto whatever the report was about.
  *
- * This pack used to read three fields off an IP report — country, ASN, owner — and drop the rest,
- * which meant it dropped the 91 engine verdicts, the detection counts, the reputation and the
- * community votes. Those are not extras; they are the answer to the question the analyst asked.
+ * Reading three fields off an IP report — country, ASN, owner — and dropping the rest would drop
+ * the 91 engine verdicts, the detection counts, the reputation and the community votes. Those are
+ * not extras; they are the answer to the question the analyst asked.
  *
  * The keys are NOT declared by the typepacks, deliberately. A typepack describes an entity — an IP
  * is an IP whether or not anyone scanned it — while these record one vendor's opinion of it at one
@@ -736,10 +736,10 @@ export const vtDomainReport = definePlugin({
             if (typeof attrs.registrar === 'string' && attrs.registrar) patch.registrar = attrs.registrar;
             const created = dateFromUnix(attrs.creation_date);
             if (created) patch.created_date = created;
-            // `expiration_date` is a plain unix field on the report. This used to be scraped out of
-            // the raw WHOIS text by matching `Registrar Registration Expiration Date:` — a
-            // registrar-specific label that the standard gTLD spelling (`Registry Expiry Date:`)
-            // and every ccTLD variant miss, so expiry was blank for most domains for no reason.
+            // `expiration_date` is a plain unix field on the report, read from there rather than
+            // scraped out of the raw WHOIS text by matching `Registrar Registration Expiration
+            // Date:` — a registrar-specific label that the standard gTLD spelling (`Registry Expiry
+            // Date:`) and every ccTLD variant miss, which would leave expiry blank for most domains.
             const expires = dateFromUnix(attrs.expiration_date);
             if (expires) patch.expiration_date = expires;
             if (Object.keys(patch).length) {
@@ -1289,10 +1289,10 @@ export const vtPassiveDns = definePlugin({
 // =============================================================================================
 // 6. vt_subdomains — domain subdomain fan-out
 //
-// This used to also fan URLs out over `redirects_to` and `contacted_domains`. Both are 403
+// URLs are not fanned out over `redirects_to` or `contacted_domains`. Both are 403
 // ForbiddenError on a community key (measured; the body even names the relationship in
-// `meta.relationship`), so on the tier this pack is FOR they were two guaranteed-wasted requests
-// per URL and a "2 relation(s) skipped" line on every run. Removed rather than skipped — a
+// `meta.relationship`), so on the tier this pack is FOR they would be two guaranteed-wasted
+// requests per URL and a "2 relation(s) skipped" line on every run. Left out rather than skipped — a
 // capability an analyst can never exercise is not a graceful degradation, it is a dead menu entry
 // that costs quota to discover. They belong in a paid-key pack.
 // =============================================================================================

@@ -82,7 +82,6 @@ export interface PluginManifest {
         desktop?: {
             runtime: 'sandbox-js' | 'native' | 'subprocess';
             entry: string;
-            min_app_version?: string;
             fallback?: string;
         };
     };
@@ -102,7 +101,6 @@ export interface PluginManifest {
         progress?: 'none' | 'determinate' | 'indeterminate';
         persistence?: 'ephemeral' | 'opt-in' | 'always';
     };
-    distribution?: Record<string, any>;
 }
 export interface TypeRef {
     typepack: string;
