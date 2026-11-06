@@ -2,8 +2,12 @@
 // serves. Everything is inlined (the SDK is types plus identity helpers), because the module is
 // fetched by URL in a Web Worker with no import map: any bare specifier left in it would fail.
 //
-// Same esbuild flags as the other pack repos' build scripts:
-//   esbuild --bundle --format=esm --target=es2022 --platform=browser --minify
+// esbuild is pinned so that anyone can check the published bundle against this source:
+//
+//   node build.mjs && git diff --exit-code dist/pack.mjs
+//
+// The version is not cosmetic: esbuild 0.27.5 started declaring a class field for each TypeScript
+// parameter property, so a floating `npx esbuild` changed these bytes with no change to the source.
 //
 // Usage: node build.mjs
 import { execFileSync } from 'node:child_process';
@@ -17,7 +21,8 @@ mkdirSync(join(here, 'dist'), { recursive: true });
 execFileSync(
     'npx',
     [
-        'esbuild',
+        '--yes',
+        'esbuild@0.25.12',
         join(here, 'src', 'virustotal-community.ts'),
         '--bundle',
         '--format=esm',
