@@ -257,6 +257,7 @@ export interface VineyardPluginPack {
     content_type?: 'vineyard:pluginpack';
     name: string;
     version: string;
+    summary?: string;
     description?: string;
     plugins: VineyardPlugin[];
 }
