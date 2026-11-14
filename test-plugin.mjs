@@ -631,6 +631,7 @@ const vtErr = (code, message) => ({ error: { code, message } });
   check("dns: linked with 'has record'", graph.createdEdges.filter((e) => e.label === "has record").length === 3);
   const cert = graph.createdNodes.find((n) => n.type === "infrastructure.certificate");
   check("cert: identity is the SHA-256 thumbprint, so a shared cert is one node", cert.data.fingerprint_sha256 === body.data.attributes.last_https_certificate.thumbprint_sha256);
+  check("cert: no fingerprint_sha1 key when VT gave no SHA-1 thumbprint", !("fingerprint_sha1" in cert.data));
   check("cert: subject CN and issuer carried", cert.data.subject_common_name === "*.google.com" && cert.data.issuer === "Google Trust Services — WR2");
   // VT stamps validity as `YYYY-MM-DD HH:MM:SS`; the typepack declares datetime.
   check("cert: validity converted to ISO datetimes", cert.data.not_before === "2026-07-20T18:05:56Z" && cert.data.not_after === "2026-10-12T18:05:55Z");
@@ -692,6 +693,8 @@ const sansOf = (graph) => {
   const r = await ipPlugin.run({ ...RUN, config: KEY, input: { selection: ["ip1"] }, net, graph });
   const cert = graph.createdNodes.find((n) => n.type === "infrastructure.certificate");
   check("ip cert: the IP's certificate is created with the domain report's fields", cert && cert.data.fingerprint_sha256 === googleCert([]).thumbprint_sha256 && cert.data.issuer === "Google Trust Services — WR2" && cert.data.not_after === "2026-10-12T18:05:55Z");
+  // SSLBL lists certificates by SHA-1 only, and a SHA-256 cannot be turned into one.
+  check("ip cert: VT's SHA-1 thumbprint is kept as fingerprint_sha1", cert && cert.data.fingerprint_sha1 === googleCert([]).thumbprint);
   check("ip cert: linked IP -> certificate by 'presents certificate'", graph.createdEdges.some((e) => e.from === "ip1" && e.to === cert?.id && e.label === "presents certificate"));
   check("ip cert: its SAN names become Domains", sansOf(graph).join() === "example.org,mail.example.org");
   check("ip cert: counted", r.counts.certs === 1 && r.counts.sans === 2);

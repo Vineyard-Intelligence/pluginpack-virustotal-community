@@ -24,7 +24,8 @@ Each DNS name in a certificate's subject alternative names becomes an `infrastru
 certificate → domain by `names domain` (a name a certificate lists may never have served it, so not
 `has certificate`). `*.` is stripped, duplicates merge, and IP entries, single labels and internal
 names (`localhost`, `*.local`, `*.lan` …) are dropped. The certificate records `san_count`, the
-number of names it lists.
+number of names it lists, and VT's SHA-1 `thumbprint` as `fingerprint_sha1` — the value the abuse.ch
+SSLBL blacklist names certificates by, which the abuse.ch pack's SSLBL Certificate Check matches on.
 
 - **More than 25 names: none are added.** A list that long is a CDN or shared-hosting certificate
   whose tenants are unrelated; the certificate node is already what they share, and `san_count` says

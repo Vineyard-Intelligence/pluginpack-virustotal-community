@@ -389,11 +389,18 @@ function certCovers(raw: unknown, domain: string): boolean {
  * thumbprint. Its identity is the SHA-256 thumbprint, so every IP and domain on a shared cert
  * converges on one node — which is the pivot worth having. `san_count` is the number of names it
  * lists, recorded even when they are too many to add (see addSanDomains).
+ *
+ * VT's `thumbprint` is the SHA-1, and it is kept as `fingerprint_sha1`: the abuse.ch SSLBL
+ * blacklist names certificates by SHA-1 alone, and a SHA-256 cannot be turned into one, so without
+ * it no certificate VT reports could be matched against the C2 families SSLBL lists.
  */
 function vtCert(cert: any): { data: Record<string, unknown>; names: string[] } | null {
     const thumb = cert?.thumbprint_sha256;
     if (typeof thumb !== 'string' || !/^[a-f0-9]{64}$/i.test(thumb)) return null;
     const data: Record<string, unknown> = { fingerprint_sha256: thumb };
+    if (typeof cert.thumbprint === 'string' && /^[a-f0-9]{40}$/i.test(cert.thumbprint)) {
+        data.fingerprint_sha1 = cert.thumbprint.toLowerCase();
+    }
     if (typeof cert.subject?.CN === 'string') data.subject_common_name = cert.subject.CN;
     const issuer = [cert.issuer?.O, cert.issuer?.CN].filter((x: unknown) => typeof x === 'string' && x);
     if (issuer.length) data.issuer = issuer.join(' — ');
@@ -548,7 +555,7 @@ export const vtIpReport = definePlugin({
         identifier: 'run.vineyard.plugins.vt_ip_report',
         content_type: 'vineyard:plugin',
         name: 'VT IP Report',
-        version: '1.6.1',
+        version: '1.7.0',
         description:
             "Looks up each selected IP Address on VirusTotal and writes the verdict onto it: malicious/suspicious/harmless/undetected counts, the flagging engines (vt_detections), reputation, votes and tags, plus country_code, asn and organization. Creates the last HTTPS Certificate it presented ('presents certificate', with san_count) and, when the certificate lists 25 names or fewer, each as a Domain ('names domain'). Links an Autonomous System ('announced by'), Netblock ('within netblock') and that netblock's WHOIS Record ('has whois') only when they already exist in the project. Needs a VirusTotal API key. Desktop only.",
         icon: 'radar',
@@ -680,7 +687,7 @@ export const vtDomainReport = definePlugin({
         identifier: 'run.vineyard.plugins.vt_domain_report',
         content_type: 'vineyard:plugin',
         name: 'VT Domain Report',
-        version: '1.6.1',
+        version: '1.7.0',
         description:
             "Looks up each selected Domain on VirusTotal and writes the verdict onto it (detection counts, flagging engines, reputation, votes, tags, vt_categories) plus registrar, created_date and expiration_date. Creates up to 25 DNS Records VirusTotal last saw ('has record') and the last HTTPS Certificate ('has certificate', with san_count); when that certificate covers the domain and lists 25 names or fewer, each other name becomes a Domain ('names domain'). Fills and links a WHOIS Record only if one already exists ('has whois'). Needs a VirusTotal API key. Desktop only.",
         icon: 'globe',
@@ -812,7 +819,7 @@ export const vtUrlReport = definePlugin({
         identifier: 'run.vineyard.plugins.vt_url_report',
         content_type: 'vineyard:plugin',
         name: 'VT URL Report',
-        version: '1.6.1',
+        version: '1.7.0',
         description:
             "Looks up each selected URL on VirusTotal and writes the verdict onto it (detection counts, flagging engines, reputation, votes, tags, vt_categories, vt_threat_names) plus http_status, page_title, final_url and domain. Links the last serving IP Address ('resolves to'), up to 25 redirect-chain URLs ('redirects to'), up to 25 outgoing-link hosts as Domains ('has domain') and the served content's SHA-256 as a File Hash ('has hash'). Needs a VirusTotal API key. Desktop only.",
         icon: 'link',
@@ -970,7 +977,7 @@ export const vtFileReport = definePlugin({
         identifier: 'run.vineyard.plugins.vt_file_report',
         content_type: 'vineyard:plugin',
         name: 'VT File Report',
-        version: '1.6.1',
+        version: '1.7.0',
         description:
             "Looks up SHA-256/SHA-1/MD5 hashes on VirusTotal, taken from the selected File Hash or Malware nodes and the Run dialog's hashes field. Writes all three hashes, size, file type, tags, detection counts, the flagging engines with their malware names, reputation, ssdeep/TLSH and submission stats onto the selected File Hash (else a matching existing one, else a new one), which the other selected nodes link to ('has hash'). Adds the suggested threat label as a Malware family node ('classified as'). Needs a VirusTotal API key. Desktop only.",
         icon: 'file-digit',
@@ -1199,7 +1206,7 @@ export const vtPassiveDns = definePlugin({
         identifier: 'run.vineyard.plugins.vt_passive_dns',
         content_type: 'vineyard:plugin',
         name: 'VT Passive DNS',
-        version: '1.6.1',
+        version: '1.7.0',
         description:
             "Adds VirusTotal's passive DNS resolutions, up to 120 per selected node: the hostnames seen on a selected IP Address as Domain nodes, and the IP Addresses a selected Domain resolved to, each with VirusTotal's detection counts and linked Domain 'resolves to' IP Address. Needs a VirusTotal API key. Desktop only.",
         icon: 'git-fork',
@@ -1301,7 +1308,7 @@ export const vtSubdomains = definePlugin({
         identifier: 'run.vineyard.plugins.vt_subdomains',
         content_type: 'vineyard:plugin',
         name: 'VT Subdomains',
-        version: '1.6.1',
+        version: '1.7.0',
         description:
             "Adds the subdomains VirusTotal knows for each selected Domain, up to 120 per domain, as Domains linked 'subdomain of', each filled from VirusTotal's report on it: detection counts, flagging engines, reputation, votes, tags, registrar, created/expiration dates and vt_categories. Needs a VirusTotal API key. Desktop only.",
         icon: 'git-branch',
@@ -1405,7 +1412,7 @@ const pack: VineyardPluginPack & {
     identifier: 'run.vineyard.pluginpacks.virustotal_community',
     content_type: 'vineyard:pluginpack',
     name: 'VirusTotal Community',
-    version: '1.6.1',
+    version: '1.7.0',
     summary:
         "VirusTotal v3 reports (IP, domain, URL, file) and pivots (passive DNS, subdomains), limited to what a free community API key can read. Needs the analyst's own VirusTotal API key; a community key allows 240 requests/hour and 500/day. Desktop only.",
     description: PAGE,
