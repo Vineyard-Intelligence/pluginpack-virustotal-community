@@ -1016,8 +1016,10 @@ const sansOf = (graph) => {
 // ================================================================ raw results: ctx.retain
 // Invariants, from the plugin raw results spec (§5, §9-1, §12):
 //   - The four REPORT plugins keep the FINAL answer for each looked-up node on that node, op
-//     "report": a 2xx, and the 404/400/403 item misses too (the analyst keeps error answers). A
-//     retried 429 is never kept, and a run-ending error (401, quota exhausted) keeps nothing.
+//     "report" — only a 2xx that carries a report (non-empty data.attributes). An item miss
+//     (404/400/403) and an empty 2xx keep nothing (analyst's decision 2026-11-25: they add nothing
+//     to the node and fill it with noise). A retried 429 is never kept, and a run-ending error
+//     (401, quota exhausted) keeps nothing.
 //   - The body handed over is the response's own text, whole — never a slice or a re-serialised
 //     parse — so the host hashes the bytes VirusTotal sent.
 //   - Nothing handed to retain carries the API key, the x-apikey header or a URL: the request never
@@ -1140,21 +1142,39 @@ for (const c of RETAIN_CASES) {
   check(`retain throw ${c.name}: the run still succeeds with the same result`, !(hres instanceof Error) && JSON.stringify(hres) === JSON.stringify(res));
   check(`retain throw ${c.name}: logged once, without the host's message`, h.logs.filter((l) => l === "Raw report result not kept — the host could not keep it").length === 1 && !h.logs.some((l) => /blew up/.test(l)));
 
-  // An item miss (404 for node a) is kept on that node as evidence; the hit on b is kept on b.
-  const missText = raw(vtErr("NotFoundError", "Resource not found"));
-  const missSpy = retainSpy();
+  // An item miss (404, 400 or 403 for node a) keeps nothing; the hit on b is still kept on b.
   const firstKey = c.keyOf(new URL(t.net.calls.find((x) => c.keyOf(new URL(x.url)) !== null).url));
-  const m = retainRun(c.plugin, {
-    nodes: c.nodes,
-    selection: sel,
-    respond: reportResponder(c, (k) => (k === firstKey ? { status: 404, body: vtErr("NotFoundError", "Resource not found"), text: missText } : null)),
-    retain: missSpy,
-  });
-  const mres = await m.run();
-  check(`retain ${c.name}: a 404 miss is kept on its own node, the hit on its own`, missSpy.calls.map((x) => `${x[0]}:${x[1]}:${x[2].status}`).join() === "a:report:404,b:report:200");
-  check(`retain ${c.name}: ...with VirusTotal's own error text`, missSpy.calls[0]?.[2].body === missText);
-  check(`retain ${c.name}: ...and the miss still skips the item`, mres.counts.misses === 1);
-  check(`retain ${c.name}: no key or URL in a kept error answer either`, leaks(missSpy.calls).length === 0);
+  for (const [status, code] of [[404, "NotFoundError"], [400, "InvalidArgumentError"], [403, "ForbiddenError"]]) {
+    const missSpy = retainSpy();
+    const m = retainRun(c.plugin, {
+      nodes: c.nodes,
+      selection: sel,
+      respond: reportResponder(c, (k) => (k === firstKey ? { status, body: vtErr(code, "x"), text: raw(vtErr(code, "x")) } : null)),
+      retain: missSpy,
+    });
+    const mres = await m.run();
+    check(`retain ${c.name}: a ${status} miss keeps nothing, the hit is still kept on its own node`, missSpy.calls.map((x) => `${x[0]}:${x[1]}:${x[2].status}`).join() === "b:report:200");
+    check(`retain ${c.name}: ...the ${status} miss still skips the item`, mres.counts.misses === 1);
+    check(`retain ${c.name}: ...and says nothing about raw results`, !m.logs.some((l) => /not kept/.test(l)));
+  }
+
+  // A 2xx with nothing about the node (no data, no attributes, empty attributes) keeps nothing;
+  // the report on b is still kept whole.
+  for (const [label, emptyBody] of [["no data", {}], ["no attributes", { data: { id: "x", type: c.name } }], ["empty attributes", { data: { id: "x", type: c.name, attributes: {} } }]]) {
+    const emptySpy = retainSpy();
+    const em = retainRun(c.plugin, {
+      nodes: c.nodes,
+      selection: sel,
+      respond: reportResponder(c, (k) => (k === firstKey ? { status: 200, body: emptyBody, text: raw(emptyBody), headers: RESPONSE_HEADERS } : null)),
+      retain: emptySpy,
+    });
+    const emres = await em.run().catch((e) => e);
+    const bKey = c.keyOf(new URL(em.net.calls.filter((x) => c.keyOf(new URL(x.url)) !== null)[1].url));
+    check(
+      `retain ${c.name}: a 2xx with ${label} keeps nothing, the report on b is kept whole`,
+      !(emres instanceof Error) && emptySpy.calls.map((x) => `${x[0]}:${x[1]}`).join() === "b:report" && emptySpy.calls[0][2].body === raw(c.body(bKey)),
+    );
+  }
 
   // A rejected key ends the run and keeps nothing.
   const badSpy = retainSpy();
@@ -1235,8 +1255,8 @@ for (const c of RETAIN_CASES) {
   await b.run();
   check("retain file: one file on two selected File Hash nodes is kept on each", b.net.calls.length === 1 && both.calls.map((x) => x[0]).sort().join() === "fa,fb" && both.calls.every((x) => x[2].body === raw(body)));
 
-  // Misses: kept on a selected File Hash node that carried the hash; a typed hash or a Malware node
-  // has no File Hash node to keep it on, and a miss creates none.
+  // Misses keep nothing anywhere: not on a selected File Hash node that carried the hash, a typed
+  // hash, or a Malware node — and a miss creates no node.
   const missFor = (nodes, selection, params) => {
     const spy = retainSpy();
     return { spy, t: retainRun(filePlugin, { nodes, selection, params, respond: () => ({ status: 404, body: vtErr("NotFoundError", "x") }), retain: spy }) };
@@ -1247,6 +1267,16 @@ for (const c of RETAIN_CASES) {
   const malMiss = missFor({ m1: { id: "m1", type: "threat.malware", data: { name: "X", hash_sha256: "9".repeat(64) } } }, ["m1"]);
   await malMiss.t.run();
   check("retain file: a Malware node's unknown hash keeps nothing on the Malware node", malMiss.spy.calls.length === 0);
+  const selfMiss = missFor({ f1: { id: "f1", type: "threat.file_hash", data: { sha256: "9".repeat(64) } } }, ["f1"]);
+  await selfMiss.t.run();
+  check("retain file: a selected File Hash node VirusTotal does not know keeps nothing", selfMiss.t.net.calls.length === 1 && selfMiss.spy.calls.length === 0);
+
+  // A typed SHA-256 whose 2xx report has no attributes keeps nothing (the hash stands in for the
+  // missing SHA-256, so the plugin still gets past the hash check).
+  const emptyTyped = retainSpy();
+  const et = retainRun(filePlugin, { nodes: {}, selection: [], params: { hashes: "8".repeat(64) }, respond: () => ({ status: 200, body: { data: { attributes: {} } } }), retain: emptyTyped });
+  await et.run();
+  check("retain file: a typed hash with an empty 2xx report keeps nothing", et.net.calls.length === 1 && emptyTyped.calls.length === 0);
 }
 {
   // List answers are not reports: Passive DNS and Subdomains keep nothing.
@@ -1261,7 +1291,7 @@ for (const c of RETAIN_CASES) {
   }
 }
 {
-  check("pack version is 1.8.0", pack.version === "1.8.0");
+  check("pack version is 1.9.0", pack.version === "1.9.0");
 }
 
 // ================================================================ manifest: JS literal vs. JSON

@@ -124,14 +124,12 @@ function vtKey(ctx: HostContext): string {
     return k.trim();
 }
 
-/** A decoded v3 error: `{"error": {"code", "message"}}` (introduction-errors page). `res` is that
- *  final answer, so an item miss can still be kept as evidence (see keep). */
+/** A decoded v3 error: `{"error": {"code", "message"}}` (introduction-errors page). */
 class VtError extends Error {
     constructor(
         readonly status: number,
         readonly code: string,
         msg: string,
-        readonly res?: SafeResponse,
     ) {
         super(`${code}: ${msg} (HTTP ${status})`);
     }
@@ -153,8 +151,8 @@ interface VtReply {
  * non-2xx throw a decoded VtError, except 401 — a rejected key is the run's problem, not an item's,
  * so it ends the run with a message that names the cause instead of an error code.
  *
- * Only the FINAL response leaves here, in the reply or on the VtError: a throttled 429 that was
- * retried says nothing about the indicator and must never be kept in place of the answer.
+ * Only the FINAL 2xx leaves here, in the reply: a throttled 429 that was retried says nothing
+ * about the indicator and must never be kept in place of the answer.
  */
 async function vtCall(ctx: HostContext, path: string): Promise<VtReply> {
     if (ctx.signal?.aborted) throw abortErr();
@@ -191,7 +189,7 @@ async function vtCall(ctx: HostContext, path: string): Promise<VtReply> {
             /* non-JSON error body — fall back to the status line */
         }
         if (res.status === 401) throw new Error(`VirusTotal rejected this API key (${code})`);
-        throw new VtError(res.status, code, msg, res);
+        throw new VtError(res.status, code, msg);
     }
 }
 
@@ -214,6 +212,11 @@ const keepNoted = new WeakMap<HostContext, Set<string>>();
  *     is always the whole original text — never a slice or a re-serialised parse — so the host
  *     hashes the bytes VirusTotal sent;
  *   - status 0 is never a response: nothing that did not come back from VirusTotal is kept;
+ *   - only a 2xx that says something about the node reaches here (see hasReport): an item miss
+ *     (404/400/403) and a report with no attributes are never kept. Analyst's decision,
+ *     2026-11-25, reversing the earlier "a 404 is a finding": a miss or an empty answer adds
+ *     nothing to the node and fills its raw results with noise, and the host now refuses non-2xx
+ *     anyway — handing one over would only log "Raw report result not kept";
  *   - a refusal (over budget, a config value seen in the body) or a throw costs the raw copy, never
  *     the run: the mapped fields are already staged and are what the analyst ran this for.
  */
@@ -235,12 +238,11 @@ async function keep(ctx: HostContext, nodeId: string, op: string, res: SafeRespo
     ctx.progress?.log?.(`Raw ${op} result not kept — ${reason}`);
 }
 
-/** Keep a final per-item miss (404/400/403) on the node it was looked up for. Kept too (analyst's
- *  decision, 2026-11-25): "VirusTotal had no record of this on this date" is itself a finding. A
- *  run-ending error (401, quota exhausted) is about the account, not the item, and never gets here
- *  with a response. */
-async function keepMiss(ctx: HostContext, nodeId: string, e: unknown): Promise<void> {
-    if (e instanceof VtError && e.res) await keep(ctx, nodeId, 'report', e.res);
+/** Whether a 2xx report says anything about the node: a `data.attributes` object with at least
+ *  one field. A report without one wrote nothing onto the node, so its raw copy is not kept. */
+function hasReport(json: any): boolean {
+    const attrs = json?.data?.attributes;
+    return !!attrs && typeof attrs === 'object' && !Array.isArray(attrs) && Object.keys(attrs).length > 0;
 }
 
 /**
@@ -615,7 +617,7 @@ export const vtIpReport = definePlugin({
         identifier: 'run.vineyard.plugins.vt_ip_report',
         content_type: 'vineyard:plugin',
         name: 'VT IP Report',
-        version: '1.8.0',
+        version: '1.9.0',
         description:
             "Looks up each selected IP Address on VirusTotal and writes the verdict onto it: malicious/suspicious/harmless/undetected counts, the flagging engines (vt_detections), reputation, votes and tags, plus country_code, asn and organization. Creates the last HTTPS Certificate it presented ('presents certificate', with san_count) and, when the certificate lists 25 names or fewer, each as a Domain ('names domain'). Links an Autonomous System ('announced by'), Netblock ('within netblock') and that netblock's WHOIS Record ('has whois') only when they already exist in the project. Needs a VirusTotal API key. Desktop only.",
         icon: 'radar',
@@ -659,12 +661,11 @@ export const vtIpReport = definePlugin({
             } catch (e) {
                 const why = itemMiss(e);
                 if (!why) throw e;
-                await keepMiss(ctx, n.id, e);
                 misses++;
                 ctx.progress?.log?.(`${ip}: ${why}`);
                 continue;
             }
-            await keep(ctx, n.id, 'report', reply.res);
+            if (hasReport(reply.json)) await keep(ctx, n.id, 'report', reply.res);
             const attrs = reply.json?.data?.attributes ?? {};
             // The verdict FIRST: it is what the analyst ran this for. country/ASN/owner are the
             // context around it, not the payload.
@@ -749,7 +750,7 @@ export const vtDomainReport = definePlugin({
         identifier: 'run.vineyard.plugins.vt_domain_report',
         content_type: 'vineyard:plugin',
         name: 'VT Domain Report',
-        version: '1.8.0',
+        version: '1.9.0',
         description:
             "Looks up each selected Domain on VirusTotal and writes the verdict onto it (detection counts, flagging engines, reputation, votes, tags, vt_categories) plus registrar, created_date and expiration_date. Creates up to 25 DNS Records VirusTotal last saw ('has record') and the last HTTPS Certificate ('has certificate', with san_count); when that certificate covers the domain and lists 25 names or fewer, each other name becomes a Domain ('names domain'). Fills and links a WHOIS Record only if one already exists ('has whois'). Needs a VirusTotal API key. Desktop only.",
         icon: 'globe',
@@ -792,12 +793,11 @@ export const vtDomainReport = definePlugin({
             } catch (e) {
                 const why = itemMiss(e);
                 if (!why) throw e;
-                await keepMiss(ctx, n.id, e);
                 misses++;
                 ctx.progress?.log?.(`${d}: ${why}`);
                 continue;
             }
-            await keep(ctx, n.id, 'report', reply.res);
+            if (hasReport(reply.json)) await keep(ctx, n.id, 'report', reply.res);
             const attrs = reply.json?.data?.attributes ?? {};
             const patch: Record<string, unknown> = verdictFields(attrs);
             // What the content-filtering vendors call this domain. On a lookup that comes back
@@ -883,7 +883,7 @@ export const vtUrlReport = definePlugin({
         identifier: 'run.vineyard.plugins.vt_url_report',
         content_type: 'vineyard:plugin',
         name: 'VT URL Report',
-        version: '1.8.0',
+        version: '1.9.0',
         description:
             "Looks up each selected URL on VirusTotal and writes the verdict onto it (detection counts, flagging engines, reputation, votes, tags, vt_categories, vt_threat_names) plus http_status, page_title, final_url and domain. Links the last serving IP Address ('resolves to'), up to 25 redirect-chain URLs ('redirects to'), up to 25 outgoing-link hosts as Domains ('has domain') and the served content's SHA-256 as a File Hash ('has hash'). Needs a VirusTotal API key. Desktop only.",
         icon: 'link',
@@ -936,12 +936,11 @@ export const vtUrlReport = definePlugin({
             } catch (e) {
                 const why = itemMiss(e);
                 if (!why) throw e;
-                await keepMiss(ctx, n.id, e);
                 misses++;
                 ctx.progress?.log?.(`${parsed.href}: ${why}`);
                 continue;
             }
-            await keep(ctx, n.id, 'report', reply.res);
+            if (hasReport(reply.json)) await keep(ctx, n.id, 'report', reply.res);
             const attrs = reply.json?.data?.attributes ?? {};
             const patch: Record<string, unknown> = verdictFields(attrs);
             const cats = categoryField(attrs);
@@ -1046,7 +1045,7 @@ export const vtFileReport = definePlugin({
         identifier: 'run.vineyard.plugins.vt_file_report',
         content_type: 'vineyard:plugin',
         name: 'VT File Report',
-        version: '1.8.0',
+        version: '1.9.0',
         description:
             "Looks up SHA-256/SHA-1/MD5 hashes on VirusTotal, taken from the selected File Hash or Malware nodes and the Run dialog's hashes field. Writes all three hashes, size, file type, tags, detection counts, the flagging engines with their malware names, reputation, ssdeep/TLSH and submission stats onto the selected File Hash (else a matching existing one, else a new one), which the other selected nodes link to ('has hash'). Adds the suggested threat label as a Malware family node ('classified as'). Needs a VirusTotal API key. Desktop only.",
         icon: 'file-digit',
@@ -1141,12 +1140,7 @@ export const vtFileReport = definePlugin({
             } catch (e) {
                 const why = itemMiss(e);
                 if (!why) throw e;
-                // A miss is kept only on a selected File Hash node that carried this hash: that node
-                // IS the file VirusTotal has no record of. A Malware node that named the hash is not
-                // the file (a hit would land on a File Hash node, not on it), and a hash typed into
-                // the Run dialog has no node at all — a miss creates none, so nothing is kept.
-                const selfIds = new Set((sources.get(hash) ?? []).filter((o) => o.type === 'threat.file_hash').map((o) => o.id));
-                for (const id of selfIds) await keepMiss(ctx, id, e);
+                // A miss keeps nothing on any node (see keep).
                 misses++;
                 ctx.progress?.log?.(`${hash}: ${why === 'no VirusTotal record' ? 'unknown file on VirusTotal' : why}`);
                 continue;
@@ -1232,7 +1226,9 @@ export const vtFileReport = definePlugin({
             // The report describes the file, so it is kept on the File Hash node(s) it was written
             // onto — the selected one when the analyst selected it — never on a Malware node that
             // merely named the hash, which is linked to the file instead.
-            for (const n of selfNodes.length ? selfNodes : [fileNode]) await keep(ctx, n.id, 'report', reply.res);
+            // A report with no attributes still reaches here when the hash looked up was a SHA-256
+            // (it stands in for the missing one), but it wrote nothing onto the node: not kept.
+            if (hasReport(reply.json)) for (const n of selfNodes.length ? selfNodes : [fileNode]) await keep(ctx, n.id, 'report', reply.res);
             for (const n of byId.values()) {
                 if (n.type === 'threat.file_hash') continue; // enriched in place above — same entity
                 await ensureEdge(ctx, n.id, fileNode.id, 'has hash');
@@ -1285,7 +1281,7 @@ export const vtPassiveDns = definePlugin({
         identifier: 'run.vineyard.plugins.vt_passive_dns',
         content_type: 'vineyard:plugin',
         name: 'VT Passive DNS',
-        version: '1.8.0',
+        version: '1.9.0',
         description:
             "Adds VirusTotal's passive DNS resolutions, up to 120 per selected node: the hostnames seen on a selected IP Address as Domain nodes, and the IP Addresses a selected Domain resolved to, each with VirusTotal's detection counts and linked Domain 'resolves to' IP Address. Needs a VirusTotal API key. Desktop only.",
         icon: 'git-fork',
@@ -1387,7 +1383,7 @@ export const vtSubdomains = definePlugin({
         identifier: 'run.vineyard.plugins.vt_subdomains',
         content_type: 'vineyard:plugin',
         name: 'VT Subdomains',
-        version: '1.8.0',
+        version: '1.9.0',
         description:
             "Adds the subdomains VirusTotal knows for each selected Domain, up to 120 per domain, as Domains linked 'subdomain of', each filled from VirusTotal's report on it: detection counts, flagging engines, reputation, votes, tags, registrar, created/expiration dates and vt_categories. Needs a VirusTotal API key. Desktop only.",
         icon: 'git-branch',
@@ -1491,7 +1487,7 @@ const pack: VineyardPluginPack & {
     identifier: 'run.vineyard.pluginpacks.virustotal_community',
     content_type: 'vineyard:pluginpack',
     name: 'VirusTotal Community',
-    version: '1.8.0',
+    version: '1.9.0',
     summary:
         "VirusTotal v3 reports (IP, domain, URL, file) and pivots (passive DNS, subdomains), limited to what a free community API key can read. Needs the analyst's own VirusTotal API key; a community key allows 240 requests/hour and 500/day. Desktop only.",
     description: PAGE,
