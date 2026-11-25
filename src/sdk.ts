@@ -228,6 +228,20 @@ export interface HostContext {
      */
     service?(name: string, path: string, init?: SafeRequestInit): Promise<SafeResponse>;
 
+    /**
+     * Keep a call's raw answer on the node it describes, in this plugin's own slot of the node's
+     * hidden `__plugin_results` (`op` names the call, /^[a-z][a-z0-9_]{0,63}$/). The host stamps
+     * the time, versions, hash and size, cuts the body to its budget and keeps only allow-listed
+     * response headers; nothing about the request is stored. Absent on hosts that predate it, so
+     * check `typeof ctx.retain === 'function'` first. A refusal resolves to `{ kept: false, reason }`.
+     */
+    retain?(
+        nodeId: string,
+        op: string,
+        response: SafeResponse | { status: number; headers?: Record<string, string>; body: unknown },
+        opts?: { history?: boolean },
+    ): Promise<{ kept: boolean; reason?: string }>;
+
     progress?: {
         set?(p: { percent?: number; message?: string; phase?: string }): void;
         log?(line: string): void;

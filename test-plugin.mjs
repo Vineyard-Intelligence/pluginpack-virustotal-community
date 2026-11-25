@@ -52,7 +52,8 @@ function makeGraph(nodeById) {
   };
 }
 
-// respond(url) -> { status, body } | { status, html } for a non-JSON error body.
+// respond(url) -> { status, body } | { status, html } for a non-JSON error body. `text` sets the raw
+// body text text() returns when it should differ from a plain JSON.stringify of `body`.
 function makeNet(respond) {
   const calls = [];
   return {
@@ -65,7 +66,7 @@ function makeNet(respond) {
         status: r.status,
         headers: r.headers ?? {},
         async text() {
-          return r.html ?? JSON.stringify(r.body ?? {});
+          return r.text ?? r.html ?? JSON.stringify(r.body ?? {});
         },
         async json() {
           if (r.html) throw new SyntaxError("not JSON");
@@ -1010,6 +1011,257 @@ const sansOf = (graph) => {
   if (missing.length) console.log("   missing:", [...new Set(missing)].join(", "));
   // "virus" is not a member of the enum; "trojan" is, and is the next-most-agreed category.
   check("required: malware_type maps from VT's own vocabulary, skipping non-members", true);
+}
+
+// ================================================================ raw results: ctx.retain
+// Invariants, from the plugin raw results spec (§5, §9-1, §12):
+//   - The four REPORT plugins keep the FINAL answer for each looked-up node on that node, op
+//     "report": a 2xx, and the 404/400/403 item misses too (the analyst keeps error answers). A
+//     retried 429 is never kept, and a run-ending error (401, quota exhausted) keeps nothing.
+//   - The body handed over is the response's own text, whole — never a slice or a re-serialised
+//     parse — so the host hashes the bytes VirusTotal sent.
+//   - Nothing handed to retain carries the API key, the x-apikey header or a URL: the request never
+//     leaves the pack.
+//   - A refusal object or a throw from retain never fails the run, and is logged once per reason.
+//   - A host without ctx.retain (every desktop build before it) runs exactly as before.
+//   - Passive DNS and Subdomains (list answers) keep nothing.
+const SECRET_KEY = "vt-SECRET-apikey-0123456789abcdef";
+const SECRET_CONFIG = { api_key: SECRET_KEY };
+const RESPONSE_HEADERS = { "content-type": "application/json", etag: '"r-1"', "x-request-id": "rq-1" };
+/** Report bodies as raw text with VT's own spacing, so a re-serialised parse would not match. */
+const raw = (obj) => JSON.stringify(obj, null, 2) + "\n";
+
+function retainSpy(answer = async () => ({ kept: true })) {
+  const calls = [];
+  const fn = async (...args) => {
+    calls.push(args);
+    return answer(...args);
+  };
+  fn.calls = calls;
+  return fn;
+}
+const leaks = (calls) => {
+  const s = JSON.stringify(calls);
+  return [SECRET_KEY, "x-apikey", "http://", "https://", "virustotal.com", "/api/v3"].filter((x) => s.includes(x));
+};
+function retainRun(plugin, { nodes, selection, respond, params, retain, config = SECRET_CONFIG }) {
+  const logs = [];
+  const net = makeNet(respond);
+  const graph = makeGraph(nodes);
+  const ctx = { ...RUN, progress: { set() {}, log: (m) => logs.push(m) }, config, params: params ?? {}, input: { selection }, net, graph };
+  if (retain !== undefined) ctx.retain = retain;
+  return { ctx, net, graph, logs, run: () => plugin.run(ctx) };
+}
+
+const RETAIN_CASES = [
+  {
+    name: "ip",
+    plugin: ipPlugin,
+    nodes: { a: { id: "a", type: "infrastructure.ip_address", data: { ip_address: "192.0.2.1" } }, b: { id: "b", type: "infrastructure.ip_address", data: { ip_address: "192.0.2.2" } } },
+    body: (tag) => ({ data: { id: tag, type: "ip_address", attributes: { country: "us", asn: 64500, as_owner: `OWNER ${tag}`, last_analysis_stats: { malicious: 1 }, last_analysis_results: { E: { category: "malicious", result: "malware" } } } } }),
+    keyOf: (url) => url.pathname.split("/").pop(),
+  },
+  {
+    name: "domain",
+    plugin: domainPlugin,
+    nodes: { a: { id: "a", type: "infrastructure.domain", data: { domain_name: "a.example" } }, b: { id: "b", type: "infrastructure.domain", data: { domain_name: "b.example" } } },
+    body: (tag) => ({ data: { id: tag, type: "domain", attributes: { registrar: `Registrar ${tag}`, last_analysis_stats: { malicious: 0 } } } }),
+    keyOf: (url) => url.pathname.split("/").pop(),
+  },
+  {
+    // The report is keyed by the URL's base64url id, not by anything on the node; it is still kept
+    // on the selected URL node it was run for.
+    name: "url",
+    plugin: urlPlugin,
+    nodes: { a: { id: "a", type: "web.url", data: { url: "http://a.example/" } }, b: { id: "b", type: "web.url", data: { url: "http://b.example/" } } },
+    body: (tag) => ({ data: { id: tag, type: "url", attributes: { title: `Title ${tag}`, last_http_response_code: 200 } } }),
+    keyOf: (url) => (url.pathname.endsWith("/last_serving_ip_address") ? null : url.pathname.split("/").pop()),
+  },
+  {
+    name: "file",
+    plugin: filePlugin,
+    nodes: { a: { id: "a", type: "threat.file_hash", data: { sha256: "1".repeat(64) } }, b: { id: "b", type: "threat.file_hash", data: { sha256: "2".repeat(64) } } },
+    body: (tag) => ({ data: { id: tag, type: "file", attributes: { sha256: tag, md5: tag.slice(0, 32), last_analysis_stats: { malicious: 2 } } } }),
+    keyOf: (url) => url.pathname.split("/").pop(),
+  },
+];
+/** VT's answer for one lookup: the relationship call (URL report) answers nothing to keep. */
+const reportResponder = (c, override) => (url) => {
+  const k = c.keyOf(url);
+  if (k === null) return { status: 404, body: vtErr("NotFoundError", "no serving IP") };
+  const o = override?.(k);
+  if (o) return o;
+  const body = c.body(k);
+  return { status: 200, body, text: raw(body), headers: RESPONSE_HEADERS };
+};
+
+for (const c of RETAIN_CASES) {
+  const sel = ["a", "b"];
+  const spy = retainSpy();
+  const t = retainRun(c.plugin, { nodes: c.nodes, selection: sel, respond: reportResponder(c), retain: spy });
+  const res = await t.run();
+  const reportCalls = t.net.calls.filter((x) => c.keyOf(new URL(x.url)) !== null);
+  check(`retain ${c.name}: one call per looked-up node, on that node, op report`, spy.calls.map((x) => `${x[0]}:${x[1]}`).join() === "a:report,b:report");
+  check(`retain ${c.name}: status and the response's own headers`, spy.calls.every((x) => x[2].status === 200 && x[2].headers.etag === '"r-1"' && x[2].headers["x-request-id"] === "rq-1"));
+  check(
+    `retain ${c.name}: the body is VirusTotal's own text, whole, for that node's lookup`,
+    spy.calls.length === 2 && spy.calls.every((x, i) => x[2].body === raw(c.body(c.keyOf(new URL(reportCalls[i].url))))),
+  );
+  check(`retain ${c.name}: a plain object with only body, headers and status`, spy.calls.every((x) => Object.keys(x[2]).sort().join() === "body,headers,status"));
+  check(`retain ${c.name}: no API key, x-apikey header or URL in anything handed over`, leaks(spy.calls).length === 0);
+  check(`retain ${c.name}: the request really carried the key`, t.net.calls.length > 0 && t.net.calls.every((x) => x.headers["x-apikey"] === SECRET_KEY));
+  check(`retain ${c.name}: no opts passed`, spy.calls.every((x) => x.length === 3));
+
+  // The same run on a host without retain: same result, same staged graph, nothing said.
+  const old = retainRun(c.plugin, { nodes: c.nodes, selection: sel, respond: reportResponder(c) });
+  const oldRes = await old.run();
+  check(`old host ${c.name}: no ctx.retain, the run is identical`, !("retain" in old.ctx) && JSON.stringify(oldRes) === JSON.stringify(res));
+  check(
+    `old host ${c.name}: ...and stages the same graph`,
+    JSON.stringify([old.graph.createdNodes, old.graph.createdEdges, old.graph.updates]) === JSON.stringify([t.graph.createdNodes, t.graph.createdEdges, t.graph.updates]),
+  );
+  check(`old host ${c.name}: says nothing about raw results`, !old.logs.some((l) => /not kept/.test(l)));
+  const notFn = retainRun(c.plugin, { nodes: c.nodes, selection: sel, respond: reportResponder(c), retain: true });
+  const notFnRes = await notFn.run().catch((e) => e);
+  check(`old host ${c.name}: a retain that is not a function is left alone`, !(notFnRes instanceof Error) && JSON.stringify(notFnRes) === JSON.stringify(res));
+
+  // A refusal is an object, not a throw — and either way the run carries on, said once.
+  const refuse = retainSpy(async () => ({ kept: false, reason: "over this run's raw-result budget" }));
+  const r = retainRun(c.plugin, { nodes: c.nodes, selection: sel, respond: reportResponder(c), retain: refuse });
+  const rres = await r.run().catch((e) => e);
+  check(`retain refusal ${c.name}: the run still succeeds with the same result`, !(rres instanceof Error) && refuse.calls.length === 2 && JSON.stringify(rres) === JSON.stringify(res));
+  check(`retain refusal ${c.name}: said once, not once per node`, r.logs.filter((l) => l === "Raw report result not kept — over this run's raw-result budget").length === 1);
+
+  const thrower = retainSpy(async () => {
+    throw new Error("host blew up");
+  });
+  const h = retainRun(c.plugin, { nodes: c.nodes, selection: sel, respond: reportResponder(c), retain: thrower });
+  const hres = await h.run().catch((e) => e);
+  check(`retain throw ${c.name}: the run still succeeds with the same result`, !(hres instanceof Error) && JSON.stringify(hres) === JSON.stringify(res));
+  check(`retain throw ${c.name}: logged once, without the host's message`, h.logs.filter((l) => l === "Raw report result not kept — the host could not keep it").length === 1 && !h.logs.some((l) => /blew up/.test(l)));
+
+  // An item miss (404 for node a) is kept on that node as evidence; the hit on b is kept on b.
+  const missText = raw(vtErr("NotFoundError", "Resource not found"));
+  const missSpy = retainSpy();
+  const firstKey = c.keyOf(new URL(t.net.calls.find((x) => c.keyOf(new URL(x.url)) !== null).url));
+  const m = retainRun(c.plugin, {
+    nodes: c.nodes,
+    selection: sel,
+    respond: reportResponder(c, (k) => (k === firstKey ? { status: 404, body: vtErr("NotFoundError", "Resource not found"), text: missText } : null)),
+    retain: missSpy,
+  });
+  const mres = await m.run();
+  check(`retain ${c.name}: a 404 miss is kept on its own node, the hit on its own`, missSpy.calls.map((x) => `${x[0]}:${x[1]}:${x[2].status}`).join() === "a:report:404,b:report:200");
+  check(`retain ${c.name}: ...with VirusTotal's own error text`, missSpy.calls[0]?.[2].body === missText);
+  check(`retain ${c.name}: ...and the miss still skips the item`, mres.counts.misses === 1);
+  check(`retain ${c.name}: no key or URL in a kept error answer either`, leaks(missSpy.calls).length === 0);
+
+  // A rejected key ends the run and keeps nothing.
+  const badSpy = retainSpy();
+  const bad = retainRun(c.plugin, { nodes: c.nodes, selection: sel, respond: () => ({ status: 401, body: vtErr("WrongCredentialsError", "Wrong API key") }), retain: badSpy });
+  const badRes = await bad.run().catch((e) => e);
+  check(`retain ${c.name}: a 401 ends the run and keeps nothing`, badRes instanceof Error && badSpy.calls.length === 0);
+}
+{
+  // Only the final answer: a throttled 429 that was retried is never kept in its place.
+  let n = 0;
+  const spy = retainSpy();
+  const body = { data: { attributes: { asn: 1 } } };
+  const t = retainRun(ipPlugin, {
+    nodes: { a: { id: "a", type: "infrastructure.ip_address", data: { ip_address: "192.0.2.1" } } },
+    selection: ["a"],
+    respond: () => (++n === 1 ? { status: 429, headers: { "retry-after": "0.01" }, body: vtErr("QuotaExceededError", "q") } : { status: 200, body, text: raw(body) }),
+    retain: spy,
+  });
+  await t.run();
+  check("retain: a retried 429 is not kept, only the final answer", t.net.calls.length === 2 && spy.calls.length === 1 && spy.calls[0][2].status === 200 && spy.calls[0][2].body === raw(body));
+
+  // Quota exhausted (still 429 after the retries) ends the run and keeps nothing.
+  const q = retainSpy();
+  const e = retainRun(ipPlugin, {
+    nodes: { a: { id: "a", type: "infrastructure.ip_address", data: { ip_address: "192.0.2.1" } } },
+    selection: ["a"],
+    respond: () => ({ status: 429, headers: { "retry-after": "0.01" }, body: vtErr("QuotaExceededError", "q") }),
+    retain: q,
+  });
+  const er = await e.run().catch((x) => x);
+  check("retain: an exhausted quota ends the run and keeps nothing", er instanceof Error && /quota exhausted/.test(er.message) && q.calls.length === 0);
+}
+{
+  // URL report: the serving-IP relationship is a second call, not the report, and is not kept.
+  const spy = retainSpy();
+  const body = { data: { attributes: { title: "T" } } };
+  const t = retainRun(urlPlugin, {
+    nodes: { u1: { id: "u1", type: "web.url", data: { url: "http://www.google.com/" } } },
+    selection: ["u1"],
+    respond: (url) => (url.pathname.endsWith("/last_serving_ip_address") ? { status: 200, body: { data: { id: "142.251.151.119", type: "ip_address" } } } : { status: 200, body, text: raw(body) }),
+    retain: spy,
+  });
+  await t.run();
+  check("retain url: only the report is kept, not the serving-IP relationship", t.net.calls.length === 2 && spy.calls.length === 1 && spy.calls[0][0] === "u1" && spy.calls[0][2].body === raw(body));
+  check("retain url: the created serving-IP node gets nothing", !spy.calls.some((x) => x[0] !== "u1"));
+}
+{
+  // File report: the report describes the FILE, so it is kept on the File Hash node it was written
+  // onto. A hash typed into the dialog keeps it on the node created for the file; a selected
+  // Malware node that only names the hash is linked to that File Hash node and keeps nothing.
+  const attrs = { sha256: "e".repeat(64), md5: "f".repeat(32), last_analysis_stats: { malicious: 1 } };
+  const body = { data: { attributes: attrs } };
+  const typed = retainSpy();
+  const t = retainRun(filePlugin, { nodes: {}, selection: [], params: { hashes: attrs.sha256 }, respond: () => ({ status: 200, body, text: raw(body) }), retain: typed });
+  await t.run();
+  check("retain file: a typed hash is kept on the File Hash node created for it", typed.calls.length === 1 && typed.calls[0][0] === t.graph.createdNodes[0].id && t.graph.createdNodes[0].type === "threat.file_hash");
+
+  const viaMalware = retainSpy();
+  const mal = retainRun(filePlugin, {
+    nodes: { m1: { id: "m1", type: "threat.malware", data: { name: "X", hash_sha256: attrs.sha256 } } },
+    selection: ["m1"],
+    respond: () => ({ status: 200, body, text: raw(body) }),
+    retain: viaMalware,
+  });
+  await mal.run();
+  const fh = mal.graph.createdNodes.find((n) => n.type === "threat.file_hash");
+  check("retain file: a Malware node's hash is kept on the File Hash node, not the Malware node", viaMalware.calls.length === 1 && fh && viaMalware.calls[0][0] === fh.id);
+
+  // Two selected File Hash nodes for one file (sha256 on one, md5 on the other): one request, and
+  // the report is kept on both, since both are this file and both were enriched with it.
+  const both = retainSpy();
+  const b = retainRun(filePlugin, {
+    nodes: { fa: { id: "fa", type: "threat.file_hash", data: { sha256: attrs.sha256 } }, fb: { id: "fb", type: "threat.file_hash", data: { md5: attrs.md5 } } },
+    selection: ["fa", "fb"],
+    respond: () => ({ status: 200, body, text: raw(body) }),
+    retain: both,
+  });
+  await b.run();
+  check("retain file: one file on two selected File Hash nodes is kept on each", b.net.calls.length === 1 && both.calls.map((x) => x[0]).sort().join() === "fa,fb" && both.calls.every((x) => x[2].body === raw(body)));
+
+  // Misses: kept on a selected File Hash node that carried the hash; a typed hash or a Malware node
+  // has no File Hash node to keep it on, and a miss creates none.
+  const missFor = (nodes, selection, params) => {
+    const spy = retainSpy();
+    return { spy, t: retainRun(filePlugin, { nodes, selection, params, respond: () => ({ status: 404, body: vtErr("NotFoundError", "x") }), retain: spy }) };
+  };
+  const typedMiss = missFor({}, [], { hashes: "9".repeat(64) });
+  await typedMiss.t.run();
+  check("retain file: a typed hash VirusTotal does not know keeps nothing", typedMiss.spy.calls.length === 0 && typedMiss.t.graph.createdNodes.length === 0);
+  const malMiss = missFor({ m1: { id: "m1", type: "threat.malware", data: { name: "X", hash_sha256: "9".repeat(64) } } }, ["m1"]);
+  await malMiss.t.run();
+  check("retain file: a Malware node's unknown hash keeps nothing on the Malware node", malMiss.spy.calls.length === 0);
+}
+{
+  // List answers are not reports: Passive DNS and Subdomains keep nothing.
+  for (const [name, plugin, nodes] of [
+    ["passive dns", resolutionsPlugin, { a: { id: "a", type: "infrastructure.ip_address", data: { ip_address: "192.0.2.1" } } }],
+    ["subdomains", subdomainsPlugin, { a: { id: "a", type: "infrastructure.domain", data: { domain_name: "a.example" } } }],
+  ]) {
+    const spy = retainSpy();
+    const t = retainRun(plugin, { nodes, selection: ["a"], respond: () => ({ status: 200, body: { data: [], meta: {} } }), retain: spy });
+    await t.run();
+    check(`retain ${name}: a list answer is not kept`, t.net.calls.length >= 1 && spy.calls.length === 0);
+  }
+}
+{
+  check("pack version is 1.8.0", pack.version === "1.8.0");
 }
 
 // ================================================================ manifest: JS literal vs. JSON
